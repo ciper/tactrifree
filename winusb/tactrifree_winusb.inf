@@ -1,0 +1,41 @@
+; tactrifree 1.0 beta - binds the OpenPort 2.0 cable (USB\VID_0403&PID_CC4D) to the inbox WinUSB driver.
+; SPDX-License-Identifier: GPL-3.0-or-later
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = USBDevice
+ClassGuid   = {88BAE032-5A81-49f0-BC3D-A4FF138216D6}
+Provider    = %ProviderName%
+CatalogFile = tactrifree_winusb.cat
+DriverVer   = 11/08/2026,1.0.1.0
+PnpLockdown = 1
+
+[Manufacturer]
+%ProviderName% = TactriFree,NTx86,NTamd64,NTarm64
+
+[TactriFree.NTx86]
+%DeviceName% = TactriFree_Install, USB\VID_0403&PID_CC4D
+
+[TactriFree.NTamd64]
+%DeviceName% = TactriFree_Install, USB\VID_0403&PID_CC4D
+
+[TactriFree.NTarm64]
+%DeviceName% = TactriFree_Install, USB\VID_0403&PID_CC4D
+
+[TactriFree_Install]
+Include = winusb.inf
+Needs   = WINUSB.NT
+
+[TactriFree_Install.Services]
+Include = winusb.inf
+Needs   = WINUSB.NT.Services
+
+[TactriFree_Install.HW]
+AddReg = TactriFree_AddReg
+
+[TactriFree_AddReg]
+HKR,,DeviceInterfaceGUIDs,0x10000,"{700E05E7-C0F6-4B43-9701-8485D5CFA2CC}","{6D1781B7-C987-4F6C-8D4F-1EFC098BEA67}"
+
+[Strings]
+ProviderName = "TactriFree project"
+DeviceName   = "OpenPort 2.0 J2534 interface (WinUSB, TactriFree)"
