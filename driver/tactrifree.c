@@ -120,7 +120,7 @@ typedef struct Device {
 
     int winusb; volatile LONG closing;
     WINUSB_INTERFACE_HANDLE wu0, wuassoc, wuio; UCHAR pin, pout; ULONG mps;
-    struct { OVERLAPPED ov; unsigned char b[512]; int pend; } rs[10]; int rnext;
+    struct { OVERLAPPED ov; unsigned char b[512]; int pend; } rs[10]; int rnext; int wuerr;
     HANDLE thread; volatile LONG run;
     HMODULE selfref;
     volatile unsigned seqctr;
@@ -203,6 +203,7 @@ static struct {
     BOOL (WINAPI *ReadPipe)(WINUSB_INTERFACE_HANDLE, UCHAR, PUCHAR, ULONG, PULONG, LPOVERLAPPED);
     BOOL (WINAPI *WritePipe)(WINUSB_INTERFACE_HANDLE, UCHAR, PUCHAR, ULONG, PULONG, LPOVERLAPPED);
     BOOL (WINAPI *AbortPipe)(WINUSB_INTERFACE_HANDLE, UCHAR);
+    BOOL (WINAPI *ResetPipe)(WINUSB_INTERFACE_HANDLE, UCHAR);
 } wu;
 static int wu_load(void){
     if(wu.m) return 1;
@@ -213,6 +214,7 @@ static int wu_load(void){
     WU_FN(Initialize) WU_FN(Free) WU_FN(GetAssociatedInterface) WU_FN(QueryInterfaceSettings) WU_FN(QueryPipe)
     WU_FN(SetPipePolicy) WU_FN(ReadPipe) WU_FN(WritePipe) WU_FN(AbortPipe)
 #undef WU_FN
+    *(FARPROC*)&wu.ResetPipe=GetProcAddress(m,"WinUsb_ResetPipe");
     wu.m=m; return 1;
 }
 
@@ -238,9 +240,17 @@ static int wu_read(Device *d, unsigned char *buf, DWORD n, DWORD ms){
         if(!ok){
             DWORD e=GetLastError();
             if(e!=ERROR_OPERATION_ABORTED && removal_error(e)){ mark_gone(d,e); return total?total:-1; }
-            wu_issue(d,i);
+            if(e!=ERROR_OPERATION_ABORTED){
+
+                dbg("WinUSB: IN pipe error %lu (%d in a row)", (unsigned long)e, d->wuerr+1);
+                if(++d->wuerr>3){ mark_gone(d,e); return total?total:-1; }
+                if(wu.ResetPipe) wu.ResetPipe(d->wuio, d->pin);
+            }
+
+            wu_issue(d,i); d->rnext=(i+1)%WU_NREAD;
             return total?total:-1;
         }
+        d->wuerr=0;
         if(got>n-(DWORD)total) got=n-(DWORD)total;
         memcpy(buf+total, d->rs[i].b, got); total+=(int)got;
         wu_issue(d,i); d->rnext=(i+1)%WU_NREAD;
@@ -624,7 +634,8 @@ static int find_winusb_device(int index, char *path, int pathlen){
     for(DWORD i=0; !found && SetupDiEnumDeviceInfo(di,i,&dd); i++){
         char ids[1024]={0}, svc[64]={0}; DWORD type=0; int match=0;
         if(!SetupDiGetDeviceRegistryPropertyA(di,&dd,SPDRP_HARDWAREID,&type,(BYTE*)ids,sizeof ids-2,NULL)) continue;
-        for(char *p=ids; *p && !match; p+=strlen(p)+1){ _strupr(p); if(strstr(p,"VID_0403&PID_CC4D")) match=1; }
+        for(char *p=ids; *p && !match; p+=strlen(p)+1){ _strupr(p);
+            if(strstr(p,"VID_0403&PID_CC4D") || (strstr(p,"VID_0403&PID_CC4C") && strstr(p,"&MI_00"))) match=1; }
         if(!match || !SetupDiGetDeviceRegistryPropertyA(di,&dd,SPDRP_SERVICE,&type,(BYTE*)svc,sizeof svc-1,NULL) || _stricmp(svc,"WinUSB")) continue;
         HKEY k=SetupDiOpenDevRegKey(di,&dd,DICS_FLAG_GLOBAL,0,DIREG_DEV,KEY_READ); if(k==INVALID_HANDLE_VALUE) continue;
         char gs[512]={0}; DWORD gl=sizeof gs-2;

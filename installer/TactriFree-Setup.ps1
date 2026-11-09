@@ -6,9 +6,12 @@
 #
 # What install does (each step logged to <ProgramFiles>\TactriFree\setup.log):
 #  1. DLLs: tactrifree32.dll -> <ProgramFiles(x86)>\TactriFree, tactrifree64.dll -> <ProgramFiles>\TactriFree.
-#  2. J2534 registry entries "TactriFree" for 32-bit programs (WOW6432Node) and 64-bit programs (native key).
+#  2. J2534 registry entries "TactriFree" for 32-bit programs (WOW6432Node) and 64-bit programs (native key). An
+#     OpenPort/Tactrix entry whose DLL no longer exists (left by a failed or removed install) is deleted: programs list
+#     it as an adapter that can never open.
 #     Programs that use the standard J2534 interface (FastECU, RomRaider, ...) then list "TactriFree J2534 for OpenPort 2.0".
-#  3. USB driver: binds the cable (USB\VID_0403&PID_CC4D, J2534 mode; never the CC4B bootloader) to Microsoft's
+#  3. USB driver: binds the cable (USB\VID_0403&PID_CC4D, or USB\VID_0403&PID_CC4C&MI_00; J2534 mode, never the CC4B
+#     bootloader) to Microsoft's
 #     built-in WinUSB driver. The package (tactrifree_winusb.inf + .cat) contains no driver code of its own. Its
 #     catalog is signed on THIS PC with a certificate created here for that one purpose; the certificate is trusted
 #     on this PC only and its private key is deleted right after signing, so nothing else can ever be signed with it.
@@ -30,7 +33,7 @@ param([switch]$Uninstall, [switch]$Plan, [string]$EcuFlashDir = '', [switch]$Ski
 $ErrorActionPreference = 'Stop'
 $Version   = '1.0 beta'
 $Here      = $PSScriptRoot
-$HwId      = 'USB\VID_0403&PID_CC4D'
+$HwIds     = @('USB\VID_0403&PID_CC4D', 'USB\VID_0403&PID_CC4C&MI_00')   # the cable, and its composite form
 $GuidEf    = '{6D1781B7-C987-4F6C-8D4F-1EFC098BEA67}'     # interface ID EcuFlash's built-in library looks for
 $Sandbox   = [bool]$SandboxRoot
 
@@ -74,9 +77,10 @@ function J2534-Values($name, $dll){
         CAN=1; ISO9141=1; ISO9141_CH1=1; ISO9141_CH2=1; ISO9141_CH3=1; ISO14230=1; ISO14230_CH1=1; ISO14230_CH2=1;
         ISO14230_CH3=1; ISO15765=1; J1850PWM=0; J1850VPW=0 }
     return $v }
-function Cable-Status(){                      # @{present; service; guids} for the J2534-mode cable (CC4D)
+function Cable-Status(){                      # @{present; service; guids} for the J2534-mode cable (CC4D / CC4C&MI_00)
     $r = @{ present=$false; service=''; guids=@(); instance='' }
-    $dev = Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -like 'USB\VID_0403&PID_CC4D\*' } | Select-Object -First 1
+    $dev = Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -like 'USB\VID_0403&PID_CC4D\*' -or $_.InstanceId -like 'USB\VID_0403&PID_CC4C&MI_00\*' } |
+        Sort-Object { -not ($_.Status -eq 'OK') } | Select-Object -First 1
     if(-not $dev){ return $r }
     $r.instance = $dev.InstanceId; $r.present = ($dev.Status -eq 'OK' -or $dev.Present)
     try { $r.service = (Get-PnpDeviceProperty -InstanceId $dev.InstanceId -KeyName DEVPKEY_Device_Service).Data } catch {}
@@ -175,6 +179,14 @@ Do-It "copy this setup (for uninstall) -> $Dir64\setup" {
 $st.files = @((Join-Path $Dir86 'tactrifree32.dll'), (Join-Path $Dir64 'tactrifree64.dll'))
 
 Step '2. J2534 registry entries'
+foreach($root in @($Reg32Root, $Reg64Root) | Select-Object -Unique){
+    $pk = $RegBase.OpenSubKey($root + '\PassThruSupport.04.04'); if(-not $pk){ continue }
+    foreach($n in $pk.GetSubKeyNames()){
+        if($n -eq 'TactriFree'){ continue }
+        $k = $pk.OpenSubKey($n); $nm = [string]$k.GetValue('Name'); $fl = [string]$k.GetValue('FunctionLibrary'); $k.Close()
+        if(($n + ' ' + $nm) -match 'OpenPort|Tactrix' -and $fl -and -not (Test-Path -LiteralPath $fl)){
+            Do-It "remove broken J2534 entry '$n' (its DLL $fl does not exist)" { Reg-Delete ($root + '\PassThruSupport.04.04\' + $n) } } }
+    $pk.Close() }
 $k32 = $Reg32Root + '\' + $J2534Key; $k64 = $Reg64Root + '\' + $J2534Key
 Do-It "HKLM\$k32  -> tactrifree32.dll (32-bit programs)" { Reg-Set $k32 (J2534-Values 'TactriFree J2534 for OpenPort 2.0' (Join-Path $Dir86 'tactrifree32.dll')) }
 if([Environment]::Is64BitOperatingSystem -or $Sandbox){
@@ -221,8 +233,11 @@ else {
         Do-It "bind the cable to it (forced, like Zadig's Replace Driver)" {
             Add-Type -TypeDefinition $newdev
             $reboot = $false
-            $ok = [TfNewDev]::UpdateDriverForPlugAndPlayDevicesW([IntPtr]::Zero, $HwId, (Join-Path $work 'tactrifree_winusb.inf'), 1, [ref]$reboot)
-            $err = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            $ok = $false; $err = 0
+            foreach($id in $HwIds){                 # whichever form of the cable is plugged in
+                $ok = [TfNewDev]::UpdateDriverForPlugAndPlayDevicesW([IntPtr]::Zero, $id, (Join-Path $work 'tactrifree_winusb.inf'), 1, [ref]$reboot)
+                $err = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                if($ok -or $err -ne 0xE000020B){ break } }
             if($ok){ Say "   cable bound to WinUSB$(if($reboot){' (Windows asks for a restart)'})"; $st.driverNote = 'TactriFree package bound' }
             elseif($err -eq 0xE000020B){ Say '   cable not plugged in: the package is installed and Windows will use it when the cable is plugged in'
                                          $st.driverNote = 'staged (cable absent)' }

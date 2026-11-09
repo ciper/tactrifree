@@ -64,15 +64,16 @@ static struct { HMODULE m;
     BOOL (WINAPI *SetPipePolicy)(WINUSB_INTERFACE_HANDLE,UCHAR,ULONG,ULONG,PVOID);
     BOOL (WINAPI *ReadPipe)(WINUSB_INTERFACE_HANDLE,UCHAR,PUCHAR,ULONG,PULONG,LPOVERLAPPED);
     BOOL (WINAPI *WritePipe)(WINUSB_INTERFACE_HANDLE,UCHAR,PUCHAR,ULONG,PULONG,LPOVERLAPPED);
-    BOOL (WINAPI *AbortPipe)(WINUSB_INTERFACE_HANDLE,UCHAR); } wu;
+    BOOL (WINAPI *AbortPipe)(WINUSB_INTERFACE_HANDLE,UCHAR); BOOL (WINAPI *ResetPipe)(WINUSB_INTERFACE_HANDLE,UCHAR); } wu;
 static int wu_load(void){
     if(wu.m) return 1; HMODULE m=LoadLibraryExA("winusb.dll",NULL,LOAD_LIBRARY_SEARCH_SYSTEM32); if(!m) return 0;
 #define F(x) if(!(*(FARPROC*)&wu.x=GetProcAddress(m,"WinUsb_" #x))) return 0;
     F(Initialize) F(Free) F(GetAssociatedInterface) F(QueryInterfaceSettings) F(QueryPipe) F(SetPipePolicy) F(ReadPipe) F(WritePipe) F(AbortPipe)
 #undef F
+    *(FARPROC*)&wu.ResetPipe=GetProcAddress(m,"WinUsb_ResetPipe");
     wu.m=m; return 1; }
 
-typedef struct Pend { IOSB *iosb; HANDLE ev; unsigned char *buf; ULONG len; struct Pend *next; } Pend;
+typedef struct Pend { IOSB *iosb; HANDLE ev; unsigned char *buf; ULONG len; DWORD tid; struct Pend *next; } Pend;
 #define RING 16384
 #define NRD 10
 typedef struct Br {
@@ -98,17 +99,33 @@ static Br *enter_br(HANDLE h){
     return b; }
 static void leave_br(Br *b){ if(b) InterlockedDecrement(&b->busy); }
 
+static int thread_alive(DWORD tid){
+    if(tid==GetCurrentThreadId()) return 1;
+    HANDLE t=OpenThread(SYNCHRONIZE,FALSE,tid); if(!t) return 0;
+    int alive = WaitForSingleObject(t,0)==WAIT_TIMEOUT; CloseHandle(t); return alive; }
 static void complete(Pend *p, NTSTATUS st, ULONG n){
-    p->iosb->Information=n; MemoryBarrier(); p->iosb->Status=st; if(p->ev) SetEvent(p->ev); }
+    __try { p->iosb->Information=n; MemoryBarrier(); p->iosb->Status=st; } __except(EXCEPTION_EXECUTE_HANDLER){ return; }
+    if(p->ev) SetEvent(p->ev); }
 
 static void serve(Br *b){
     while(b->ph && b->rc>0){
-        Pend *p=b->ph; ULONG n=(ULONG)b->rc<p->len?(ULONG)b->rc:p->len;
-        for(ULONG i=0;i<n;i++){ p->buf[i]=b->ring[b->rt]; b->rt=(b->rt+1)%RING; } b->rc-=(int)n;
-        b->ph=p->next; if(!b->ph) b->pt=NULL; complete(p,ST_SUCCESS,n); HeapFree(GetProcessHeap(),0,p); b->nreads++;
+        Pend *p=b->ph; b->ph=p->next; if(!b->ph) b->pt=NULL;
+        if(!thread_alive(p->tid)){ logf_("parked read of exited thread %lu dropped",(unsigned long)p->tid); HeapFree(GetProcessHeap(),0,p); continue; }
+        ULONG n=(ULONG)b->rc<p->len?(ULONG)b->rc:p->len; int bad=0; int rt=b->rt;
+        __try { for(ULONG i=0;i<n;i++){ p->buf[i]=b->ring[rt]; rt=(rt+1)%RING; } } __except(EXCEPTION_EXECUTE_HANDLER){ bad=1; }
+        if(bad){ logf_("parked read buffer not writable - read dropped"); HeapFree(GetProcessHeap(),0,p); continue; }
+        b->rt=rt; b->rc-=(int)n;
+        complete(p,ST_SUCCESS,n); HeapFree(GetProcessHeap(),0,p); b->nreads++;
     } }
+
+static void fail_some(Br *b, NTSTATUS st, DWORD tid, IOSB *req, int drop){
+    Pend **pp=&b->ph, *last=NULL;
+    while(*pp){ Pend *p=*pp;
+        if((tid && p->tid==tid) || (req && p->iosb==req)){ *pp=p->next; if(!drop && thread_alive(p->tid)) complete(p,st,0); HeapFree(GetProcessHeap(),0,p); }
+        else { last=p; pp=&p->next; } }
+    b->pt=last; }
 static void fail_all(Br *b, NTSTATUS st){
-    while(b->ph){ Pend *p=b->ph; b->ph=p->next; complete(p,st,0); HeapFree(GetProcessHeap(),0,p); } b->pt=NULL; }
+    while(b->ph){ Pend *p=b->ph; b->ph=p->next; if(thread_alive(p->tid)) complete(p,st,0); HeapFree(GetProcessHeap(),0,p); } b->pt=NULL; }
 static void ring_put(Br *b, const unsigned char *d, int n){
     for(int i=0;i<n;i++){ if(b->rc==RING){ logf_("RING FULL: %d byte(s) dropped",n-i); break; }
         b->ring[b->rh]=d[i]; b->rh=(b->rh+1)%RING; b->rc++; } }
@@ -142,7 +159,7 @@ static int wu_issue(Br *b,int i){
         DWORD e=GetLastError(); logf_("WinUSB read failed (error %lu): cable removed?",e); InterlockedExchange(&b->gone,1); return 0; }
     b->rs[i].pend=1; return 1; }
 static DWORD WINAPI reader(void *arg){
-    Br *b=(Br*)arg; guard(1);
+    Br *b=(Br*)arg; guard(1); int errs=0;
     if(b->winusb){
         for(int i=0;i<NRD;i++) wu_issue(b,i);
         while(!b->stop && !b->gone){
@@ -150,8 +167,13 @@ static DWORD WINAPI reader(void *arg){
             if(WaitForSingleObject(b->rs[i].ov.hEvent,200)!=WAIT_OBJECT_0){ release_stale(b); continue; }
             DWORD got=0; BOOL ok=GetOverlappedResult(b->h,&b->rs[i].ov,&got,FALSE); b->rs[i].pend=0;
             if(!ok){ DWORD e=GetLastError(); if(b->stop) break;
-                if(e==ERROR_OPERATION_ABORTED){ wu_issue(b,i); continue; }
-                logf_("WinUSB read error %lu: cable removed",e); InterlockedExchange(&b->gone,1); break; }
+                if(e!=ERROR_OPERATION_ABORTED){
+                    int gone = e==ERROR_DEVICE_NOT_CONNECTED || e==ERROR_BAD_COMMAND || e==ERROR_GEN_FAILURE || e==ERROR_INVALID_HANDLE ||
+                               e==ERROR_NO_SUCH_DEVICE || e==ERROR_FILE_NOT_FOUND || ++errs>3;
+                    if(gone){ logf_("WinUSB read error %lu: cable removed",e); InterlockedExchange(&b->gone,1); break; }
+                    logf_("WinUSB read error %lu (%d in a row): pipe reset",e,errs); if(wu.ResetPipe) wu.ResetPipe(b->wuio,b->pin); }
+                wu_issue(b,i); b->rnext=(i+1)%NRD; continue; }
+            errs=0;
             EnterCriticalSection(&b->cs); feed(b,b->rs[i].b,(int)got); serve(b); LeaveCriticalSection(&b->cs);
             wu_issue(b,i); b->rnext=(i+1)%NRD;
         }
@@ -224,7 +246,7 @@ static int cable_is_winusb(void){
     if(di!=INVALID_HANDLE_VALUE){ SP_DEVINFO_DATA dd; dd.cbSize=sizeof dd;
         for(DWORD i=0;SetupDiEnumDeviceInfo(di,i,&dd);i++){ char ids[1024]={0},svc[64]={0}; DWORD t;
             if(!SetupDiGetDeviceRegistryPropertyA(di,&dd,SPDRP_HARDWAREID,&t,(BYTE*)ids,sizeof ids-2,NULL)) continue;
-            int m=0; for(char *p=ids;*p;p+=strlen(p)+1){ _strupr(p); if(strstr(p,"VID_0403&PID_CC4D")) m=1; }
+            int m=0; for(char *p=ids;*p;p+=strlen(p)+1){ _strupr(p); if(strstr(p,"VID_0403&PID_CC4D") || (strstr(p,"VID_0403&PID_CC4C") && strstr(p,"&MI_00"))) m=1; }
             if(m && SetupDiGetDeviceRegistryPropertyA(di,&dd,SPDRP_SERVICE,&t,(BYTE*)svc,sizeof svc-1,NULL) && !_stricmp(svc,"WinUSB")){ r=1; break; } }
         SetupDiDestroyDeviceInfoList(di); }
     val=r; at=GetTickCount(); return r; }
@@ -233,7 +255,8 @@ static int cable_path(OBJATTR *oa){
     if(!oa||!oa->ObjectName||!oa->ObjectName->Buffer) return 0; wchar_t b[401]; int n=oa->ObjectName->Length/2; if(n>400) n=400;
     for(int i=0;i<n;i++) b[i]=towlower(oa->ObjectName->Buffer[i]); b[n]=0;
     if(g_testpath[0] && wcsstr(b,g_testpath)) return 3;
-    return wcsstr(b,L"vid_0403&pid_cc4d")?1 : wcsstr(b,L"vid_0403&pid_cc4b")?2 : 0; }
+    if(wcsstr(b,L"vid_0403&pid_cc4d") || (wcsstr(b,L"vid_0403&pid_cc4c") && wcsstr(b,L"&mi_00"))) return 1;
+    return wcsstr(b,L"vid_0403&pid_cc4b")?2 : 0; }
 
 static int afd_path(OBJATTR *oa){
     if(!oa||!oa->ObjectName||!oa->ObjectName->Buffer) return 0; int n=oa->ObjectName->Length/2; const wchar_t *w=oa->ObjectName->Buffer;
@@ -260,6 +283,7 @@ static NTSTATUS NTAPI hCreate(PHANDLE ph,ACCESS_MASK a,OBJATTR *oa,IOSB *io,PLAR
     guard(0); return st; }
 static NTSTATUS NTAPI hRead(HANDLE h,HANDLE ev,PVOID apc,PVOID ctx,IOSB *io,PVOID buf,ULONG len,PLARGE_INTEGER off,PULONG key){
     Br *b=guarded()?NULL:enter_br(h); if(!b) return oRead(h,ev,apc,ctx,io,buf,len,off,key);
+    ev=(HANDLE)((ULONG_PTR)ev & ~(ULONG_PTR)1);
     if(!init_session(b) || b->gone){ io->Information=0; io->Status=ST_NOT_CONNECTED; if(ev) SetEvent(ev); leave_br(b); return ST_NOT_CONNECTED; }
     if(apc) logf_("NOTE: read with an APC routine (unexpected)");
     EnterCriticalSection(&b->cs);
@@ -269,7 +293,7 @@ static NTSTATUS NTAPI hRead(HANDLE h,HANDLE ev,PVOID apc,PVOID ctx,IOSB *io,PVOI
         LeaveCriticalSection(&b->cs); io->Information=n; io->Status=ST_SUCCESS; if(ev) SetEvent(ev); leave_br(b); return ST_SUCCESS; }
     Pend *p=(Pend*)HeapAlloc(GetProcessHeap(),0,sizeof *p);
     if(!p){ LeaveCriticalSection(&b->cs); leave_br(b); return (NTSTATUS)0xC000009AL; }
-    p->iosb=io; p->ev=ev; p->buf=(unsigned char*)buf; p->len=len; p->next=NULL;
+    p->iosb=io; p->ev=ev; p->buf=(unsigned char*)buf; p->len=len; p->tid=GetCurrentThreadId(); p->next=NULL;
     io->Information=0; io->Status=ST_PENDING; if(ev) ResetEvent(ev);
     if(b->pt) b->pt->next=p; else b->ph=p; b->pt=p;
     LeaveCriticalSection(&b->cs); leave_br(b); return ST_PENDING; }
@@ -294,6 +318,7 @@ static unsigned long att_short(const unsigned char *d, ULONG n){
     ULONG carried=n-(e+1); return ds>carried ? ds-carried : 0; }
 static NTSTATUS NTAPI hWrite(HANDLE h,HANDLE ev,PVOID apc,PVOID ctx,IOSB *io,PVOID buf,ULONG len,PLARGE_INTEGER off,PULONG key){
     Br *b=guarded()?NULL:enter_br(h); if(!b) return oWrite(h,ev,apc,ctx,io,buf,len,off,key);
+    ev=(HANDLE)((ULONG_PTR)ev & ~(ULONG_PTR)1);
     const unsigned char *d=(const unsigned char*)buf; char why[64]; char pv[200];
     ULONG cont=0;
     EnterCriticalSection(&b->wcs);
@@ -315,10 +340,12 @@ static NTSTATUS NTAPI hWrite(HANDLE h,HANDLE ev,PVOID apc,PVOID ctx,IOSB *io,PVO
 static void cancel_reads(Br *b){ EnterCriticalSection(&b->cs); fail_all(b,ST_CANCELLED); LeaveCriticalSection(&b->cs); }
 static NTSTATUS NTAPI hCancel(HANDLE h,IOSB *io){
     Br *b=guarded()?NULL:enter_br(h); if(!b) return oCancel(h,io);
-    cancel_reads(b); if(io){ io->Information=0; io->Status=ST_SUCCESS; } leave_br(b); return ST_SUCCESS; }
+    EnterCriticalSection(&b->cs); fail_some(b,ST_CANCELLED,GetCurrentThreadId(),NULL,0); LeaveCriticalSection(&b->cs);
+    if(io){ io->Information=0; io->Status=ST_SUCCESS; } leave_br(b); return ST_SUCCESS; }
 static NTSTATUS NTAPI hCancelEx(HANDLE h,IOSB *req,IOSB *io){
     Br *b=guarded()?NULL:enter_br(h); if(!b) return oCancelEx(h,req,io);
-    cancel_reads(b); if(io){ io->Information=0; io->Status=ST_SUCCESS; } leave_br(b); return ST_SUCCESS; }
+    EnterCriticalSection(&b->cs); if(req) fail_some(b,ST_CANCELLED,0,req,0); else fail_all(b,ST_CANCELLED); LeaveCriticalSection(&b->cs);
+    if(io){ io->Information=0; io->Status=ST_SUCCESS; } leave_br(b); return ST_SUCCESS; }
 static NTSTATUS NTAPI hClose(HANDLE h){
     Br *b=NULL; if(!guarded()){ EnterCriticalSection(&g_brlk); b=find_br(h); if(b && InterlockedExchange(&b->stop,1)) b=NULL; LeaveCriticalSection(&g_brlk); }
     if(!b) return oClose(h);
@@ -394,12 +421,18 @@ static void read_ini(HINSTANCE hi){
     { char tp[64]; GetPrivateProfileStringA("bridge","TestPath","",tp,sizeof tp,p); _strlwr(tp);
       MultiByteToWideChar(CP_ACP,0,tp,-1,g_testpath,64); } }
 
-#define BRIDGE_VERSION "TactriFree EcuFlash bridge 0.10 (2026-11-08)"
+#define BRIDGE_VERSION "TactriFree EcuFlash bridge 0.11 (2026-11-08)"
 __declspec(dllexport) const char * __cdecl TactriFreeBridgeVersion(void){ return BRIDGE_VERSION; }
 
 BOOL WINAPI DllMain(HINSTANCE hi, DWORD r, LPVOID rs){ (void)rs;
+    if(r==DLL_THREAD_DETACH){
+        if(g_tls<64){ DWORD me=GetCurrentThreadId();
+            for(int i=0;i<8;i++){ Br *b=NULL;
+                EnterCriticalSection(&g_brlk); if(g_br[i].used && !g_br[i].stop && g_br[i].ph){ b=&g_br[i]; InterlockedIncrement(&b->busy); } LeaveCriticalSection(&g_brlk);
+                if(!b) continue;
+                EnterCriticalSection(&b->cs); fail_some(b,ST_CANCELLED,me,NULL,1); LeaveCriticalSection(&b->cs); leave_br(b); } }
+        return TRUE; }
     if(r==DLL_PROCESS_ATTACH){
-        DisableThreadLibraryCalls(hi);
 
         { HMODULE pin; GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_PIN|GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,(LPCSTR)(void*)DllMain,&pin); }
 #ifdef AS_GLU32

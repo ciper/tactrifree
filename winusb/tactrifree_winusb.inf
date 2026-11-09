@@ -7,7 +7,7 @@ Class       = USBDevice
 ClassGuid   = {88BAE032-5A81-49f0-BC3D-A4FF138216D6}
 Provider    = %ProviderName%
 CatalogFile = tactrifree_winusb.cat
-DriverVer   = 11/08/2026,1.0.1.0
+DriverVer   = 11/08/2026,1.0.2.0
 PnpLockdown = 1
 
 [Manufacturer]
@@ -15,12 +15,15 @@ PnpLockdown = 1
 
 [TactriFree.NTx86]
 %DeviceName% = TactriFree_Install, USB\VID_0403&PID_CC4D
+%DeviceName% = TactriFree_Install, USB\VID_0403&PID_CC4C&MI_00
 
 [TactriFree.NTamd64]
 %DeviceName% = TactriFree_Install, USB\VID_0403&PID_CC4D
+%DeviceName% = TactriFree_Install, USB\VID_0403&PID_CC4C&MI_00
 
 [TactriFree.NTarm64]
 %DeviceName% = TactriFree_Install, USB\VID_0403&PID_CC4D
+%DeviceName% = TactriFree_Install, USB\VID_0403&PID_CC4C&MI_00
 
 [TactriFree_Install]
 Include = winusb.inf
