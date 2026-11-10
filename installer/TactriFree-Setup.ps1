@@ -15,7 +15,10 @@
 #     built-in WinUSB driver. The package (tactrifree_winusb.inf + .cat) contains no driver code of its own. Its
 #     catalog is signed on THIS PC with a certificate created here for that one purpose; the certificate is trusted
 #     on this PC only and its private key is deleted right after signing, so nothing else can ever be signed with it.
-#     Skipped when the cable is already on WinUSB with the interface ID EcuFlash needs (e.g. set up with Zadig).
+#     Running setup over an older TactriFree is fine: an older TactriFree driver package is replaced (with the cable
+#     plugged in the cable is re-bound at once - a short disconnect, like a replug), then the old package and its
+#     certificate are removed. Another WinUSB setup that already works (e.g. Zadig + the EcuFlash interface ID) is
+#     kept unless -RebindDriver.
 #  4. EcuFlash bridge: glu32.dll + tactrifree-bridge.ini into EcuFlash's folder (found via its uninstall entry, else
 #     the default folder). Never overwrites a glu32.dll that is not the bridge; keeps an existing ini (your settings).
 #  5. An entry in Settings > Apps for uninstalling.
@@ -31,7 +34,7 @@
 param([switch]$Uninstall, [switch]$Plan, [string]$EcuFlashDir = '', [switch]$SkipBridge, [switch]$SkipDriver,
       [switch]$RebindDriver, [string]$SandboxRoot = '', [switch]$NoPause)
 $ErrorActionPreference = 'Stop'
-$Version   = '1.0 beta'
+$Version   = '1.0 beta3'
 $Here      = $PSScriptRoot
 $HwIds     = @('USB\VID_0403&PID_CC4D', 'USB\VID_0403&PID_CC4C&MI_00')   # the cable, and its composite form
 $GuidEf    = '{6D1781B7-C987-4F6C-8D4F-1EFC098BEA67}'     # interface ID EcuFlash's built-in library looks for
@@ -100,6 +103,17 @@ function Find-EcuFlash(){
     $def = Join-Path ${env:ProgramFiles(x86)} 'OpenECU\EcuFlash'
     if(Test-Path (Join-Path $def 'ecuflash.exe')){ return $def }
     return '' }
+function Inf-Version($inf){                  # DriverVer = mm/dd/yyyy,a.b.c.d  ->  [version]
+    $m = Select-String -LiteralPath $inf -Pattern 'DriverVer\s*=\s*[^,]*,\s*([0-9.]+)' | Select-Object -First 1
+    if($m){ return [version]$m.Matches[0].Groups[1].Value }; return [version]'0.0' }
+function Our-Packages(){                      # every TactriFree WinUSB package in the driver store: @{pub; ver}
+    $r = @(); $cur = $null
+    foreach($line in (& pnputil.exe /enum-drivers)){
+        if($line -match '^\s*Published Name:\s*(\S+)'){ $cur = @{ pub = $Matches[1]; orig = ''; ver = [version]'0.0' } }
+        elseif($cur -and $line -match '^\s*Original Name:\s*(\S+)'){ $cur.orig = $Matches[1] }
+        elseif($cur -and $line -match '^\s*Driver Version:\s*\S+\s+([0-9.]+)'){
+            $cur.ver = [version]$Matches[1]; if($cur.orig -ieq 'tactrifree_winusb.inf'){ $r += [pscustomobject]$cur }; $cur = $null } }
+    return $r }
 function Read-State(){ if(Test-Path $State){ return (Get-Content $State -Raw | ConvertFrom-Json) }; return $null }
 
 # P/Invoke for the forced driver update (same call Zadig/libwdi use; must run in 64-bit PowerShell on 64-bit Windows)
@@ -120,6 +134,8 @@ if(-not $Sandbox -and -not $Plan){
         throw 'Run from 64-bit PowerShell (the .cmd launchers do this).' }
 }
 if(Get-Process ecuflash -ErrorAction SilentlyContinue){ throw 'Close EcuFlash first.' }
+foreach($pn in 'FastECU','tcuflash'){ if(Get-Process $pn -ErrorAction SilentlyContinue){ throw "Close $pn first." } }
+if(Get-Process javaw -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -match 'RomRaider' }){ throw 'Close RomRaider first.' }
 
 # ================================================================= UNINSTALL
 if($Uninstall){
@@ -141,6 +157,9 @@ if($Uninstall){
             $sp = if($Sandbox){ "Cert:\CurrentUser\$store" } else { "Cert:\LocalMachine\$store" }
             $c = Get-ChildItem $sp -ErrorAction SilentlyContinue | Where-Object { $_.Thumbprint -eq $st.certThumbprint }
             if($c){ Do-It "remove the local TactriFree signing certificate from $store" { Remove-Item $c.PSPath -Force } } } }
+    # Windows keeps a cached copy of the (public) certificate in the user's Intermediate store when it checks the signature
+    foreach($c in @(Get-ChildItem Cert:\CurrentUser\CA -ErrorAction SilentlyContinue | Where-Object { $_.Subject -like 'CN=TactriFree local driver signing*' })){
+        Do-It "remove the cached copy of TactriFree certificate $($c.Thumbprint.Substring(0,8)) from your Intermediate store" { Remove-Item $c.PSPath -Force } }
     Step 'J2534 registry entries'
     foreach($rk in ($Reg32Root + '\' + $J2534Key), ($Reg64Root + '\' + $J2534Key)){
         if($RegBase.OpenSubKey($rk)){ Do-It "delete HKLM\$rk" { Reg-Delete $rk } } }
@@ -196,11 +215,24 @@ Step '3. USB driver (WinUSB)'
 $cs = if($Sandbox){ @{ present=$false; service=''; guids=@() } } else { Cable-Status }
 $hasEf = @($cs.guids | Where-Object { $_ -ieq $GuidEf }).Count -gt 0
 Say ("   cable: " + $(if($cs.instance){ "$($cs.instance), driver service '$($cs.service)', interface IDs $(($cs.guids) -join ' ')" } else { 'not seen on this PC yet' }))
+$newVer = Inf-Version (Join-Path $Here 'driver\tactrifree_winusb.inf')
+$ours = if($Sandbox){ @() } else { @(Our-Packages) }
+$curInf = ''; if($cs.instance){ try { $curInf = [string](Get-PnpDeviceProperty -InstanceId $cs.instance -KeyName DEVPKEY_Device_DriverInfPath).Data } catch {} }
+$curOurs = @($ours | Where-Object { $_.pub -ieq $curInf }) | Select-Object -First 1
+$older = @($ours | Where-Object { $_.ver -lt $newVer })
+$current = @($ours | Where-Object { $_.ver -ge $newVer })
+if($ours){ Say ("   TactriFree driver packages in Windows: " + (($ours | ForEach-Object { "$($_.pub) v$($_.ver)" }) -join ', ') + "; this setup has v$newVer") }
+$upgrade = $older.Count -gt 0 -and (($curOurs -and $curOurs.ver -lt $newVer) -or (-not $curOurs -and -not $current -and -not (($cs.service -ieq 'WinUSB') -and $hasEf)))
 if($SkipDriver){ Say '   skipped (-SkipDriver)'; $st.driverNote = 'skipped' }
-elseif(($cs.service -ieq 'WinUSB') -and $hasEf -and -not $RebindDriver){
+elseif($curOurs -and $curOurs.ver -ge $newVer -and -not $RebindDriver){
+    Say "   the cable already uses TactriFree's driver package v$($curOurs.ver) - up to date"
+    $st.driverNote = 'TactriFree package current' }
+elseif(-not $upgrade -and ($cs.service -ieq 'WinUSB') -and $hasEf -and -not $RebindDriver){
     Say '   already on WinUSB with the interface ID EcuFlash needs - kept as it is (-RebindDriver to replace it with TactriFree''s package)'
     $st.driverNote = 'existing WinUSB binding kept' }
 else {
+    if($upgrade){ Say ("   replacing the older TactriFree driver package (" + (($older | ForEach-Object { "$($_.pub) v$($_.ver)" }) -join ', ') + ") with v$newVer" +
+                      $(if($cs.instance -and $cs.present){ '; the cable is plugged in: it disconnects for a moment while it is re-bound' } else { '' })) }
     $work = Join-Path ([IO.Path]::GetTempPath()) ('tactrifree-driver-' + [Guid]::NewGuid().ToString('N').Substring(0,8))
     Do-It "prepare the driver package in $work" { New-Item -ItemType Directory -Force $work | Out-Null
         Copy-Item (Join-Path $Here 'driver\tactrifree_winusb.inf'), (Join-Path $Here 'driver\tactrifree_winusb.cat') $work }
@@ -242,6 +274,14 @@ else {
             elseif($err -eq 0xE000020B){ Say '   cable not plugged in: the package is installed and Windows will use it when the cable is plugged in'
                                          $st.driverNote = 'staged (cable absent)' }
             else { throw ("binding failed, error 0x{0:X8}" -f $err) } }
+        foreach($o in $older){
+            Do-It "remove the older TactriFree driver package $($o.pub) v$($o.ver)" {
+                $r = (& pnputil.exe /delete-driver $o.pub /uninstall /force 2>&1 | Out-String); Say ("   pnputil: " + ($r.Trim() -replace "`r?`n",' | ')) } }
+        if($older -and $Plan){ Say '   [plan] remove the older TactriFree signing certificate(s) from Root and TrustedPublisher' }
+        elseif($older){
+            foreach($store in 'Root','TrustedPublisher'){
+                foreach($c in @(Get-ChildItem "Cert:\LocalMachine\$store" | Where-Object { $_.Subject -like 'CN=TactriFree local driver signing*' -and $_.Thumbprint -ne $st.certThumbprint })){
+                    Do-It "remove the old TactriFree signing certificate $($c.Thumbprint) from $store" { Remove-Item $c.PSPath -Force } } } }
     }
     if(-not $Plan){ Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue }
 }

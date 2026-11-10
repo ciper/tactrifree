@@ -1,4 +1,4 @@
-; tactrifree 1.0 beta - binds the OpenPort 2.0 cable (USB\VID_0403&PID_CC4D) to the inbox WinUSB driver.
+; tactrifree 1.0 beta3 - binds the OpenPort 2.0 cable (USB\VID_0403&PID_CC4D) to the inbox WinUSB driver.
 ; SPDX-License-Identifier: GPL-3.0-or-later
 
 [Version]

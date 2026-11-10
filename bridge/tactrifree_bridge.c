@@ -1,4 +1,4 @@
-/* tactrifree 1.0 beta - SPDX-License-Identifier: GPL-3.0-or-later */
+/* tactrifree 1.0 beta3 - SPDX-License-Identifier: GPL-3.0-or-later */
 #include <windows.h>
 #include <setupapi.h>
 #include <winusb.h>
@@ -35,8 +35,10 @@ static void logf_(const char *fmt, ...){
     SYSTEMTIME s; GetLocalTime(&s);
     EnterCriticalSection(&g_loglk);
     if(g_log){
-        if(ftell(g_log)>g_logmax){ char old[MAX_PATH+8]; fclose(g_log); _snprintf(old,sizeof old,"%s.old",g_logpath); old[sizeof old-1]=0;
-            DeleteFileA(old); MoveFileA(g_logpath,old); g_log=fopen(g_logpath,"ab"); }
+
+        static DWORD rotfail;
+        if(ftell(g_log)>g_logmax && (!rotfail || GetTickCount()-rotfail>60000)){ char old[MAX_PATH+8]; fclose(g_log); _snprintf(old,sizeof old,"%s.old",g_logpath); old[sizeof old-1]=0;
+            DeleteFileA(old); rotfail = MoveFileA(g_logpath,old) ? 0 : (GetTickCount()|1); g_log=fopen(g_logpath,"ab"); }
         if(g_log){ fprintf(g_log,"%02d:%02d:%02d.%03d [%lu] %s\n",s.wHour,s.wMinute,s.wSecond,s.wMilliseconds,GetCurrentProcessId(),b); fflush(g_log); }
     }
     LeaveCriticalSection(&g_loglk); }
@@ -79,6 +81,7 @@ typedef struct Pend { IOSB *iosb; HANDLE ev; unsigned char *buf; ULONG len; DWOR
 typedef struct Br {
     HANDLE h; int winusb, boot; volatile LONG used, stop, gone, inited;
     volatile LONG busy; CRITICAL_SECTION wcs;
+    CRITICAL_SECTION ics;
     WINUSB_INTERFACE_HANDLE wu0, wuassoc, wuio; UCHAR pin, pout; ULONG mps;
     struct { OVERLAPPED ov; unsigned char b[512]; int pend; } rs[NRD]; int rnext;
     OVERLAPPED ovw;
@@ -91,6 +94,7 @@ typedef struct Br {
     unsigned long att_left;
 } Br;
 static Br g_br[8]; static CRITICAL_SECTION g_brlk;
+static volatile LONG g_nbr;
 static Br *find_br(HANDLE h){ if(!h) return NULL; for(int i=0;i<8;i++) if(g_br[i].used && g_br[i].h==h) return &g_br[i]; return NULL; }
 static volatile LONG g_clockset_done;
 
@@ -200,9 +204,10 @@ static int wu_send(Br *b,const void *d,ULONG n){
 static int init_session_once(Br *b);
 
 static int init_session(Br *b){
-    LONG st=InterlockedCompareExchange(&b->inited,1,0);
-    if(st==0){ int ok=init_session_once(b); InterlockedExchange(&b->inited,ok?2:3); return ok; }
-    for(int i=0; b->inited==1 && i<5000; i++) Sleep(1);
+    if(b->inited>=2) return b->inited==2;
+    EnterCriticalSection(&b->ics);
+    if(!b->inited){ int ok=init_session_once(b); InterlockedExchange(&b->inited,ok?2:3); }
+    LeaveCriticalSection(&b->ics);
     return b->inited==2; }
 static int init_session_once(Br *b){
     guard(1);
@@ -238,6 +243,8 @@ static int init_session_once(Br *b){
             char pv[160]; fmt_bytes(r,rl,pv,sizeof pv); logf_("clock-set (as the vendor driver does at plug-in): write %d B, reply [%d] %s",w,rl,pv); }
     } else logf_("vendor-driver session: bridge reads/writes on the vendor driver handle (filter + version only)");
     b->thread=CreateThread(NULL,0,reader,b,0,NULL);
+
+    if(b->thread) SetThreadPriority(b->thread,THREAD_PRIORITY_HIGHEST);
     guard(0); return 1; }
 
 static int cable_is_winusb(void){
@@ -270,13 +277,16 @@ static NTSTATUS NTAPI hCreate(PHANDLE ph,ACCESS_MASK a,OBJATTR *oa,IOSB *io,PLAR
         if(io){ io->Information=0; io->Status=(NTSTATUS)0xC0000022L; }
         return (NTSTATUS)0xC0000022L; }
     NTSTATUS st=oCreate(ph,a,oa,io,al,fa,sh,cd,co,ea,el);
-    if(guarded() || !cable_path(oa)) return st;
+    int kind;
+    if(guarded() || !(kind=cable_path(oa))) return st;
     guard(1);
-    int kind=cable_path(oa); int sync=(co&0x30)!=0; int boot=kind==2; int win=(kind==1)?cable_is_winusb():0;
+    int sync=(co&0x30)!=0; int boot=kind==2;
     if(st<0) logf_("open cable (%s, share %lu) -> status 0x%08lX",sync?"probe":"session",sh,(unsigned long)st);
     else if(!sync){
+        int win=(kind==1)?cable_is_winusb():0;
         EnterCriticalSection(&g_brlk); Br *b=NULL; for(int i=0;i<8;i++) if(!g_br[i].used){ b=&g_br[i]; break; }
-        if(b){ memset(b,0,sizeof *b); b->h=*ph; b->boot=boot; b->winusb=win && !boot; InitializeCriticalSection(&b->cs); InitializeCriticalSection(&b->wcs); b->used=1; }
+        if(b){ memset(b,0,sizeof *b); b->h=*ph; b->boot=boot; b->winusb=win && !boot; InitializeCriticalSection(&b->cs); InitializeCriticalSection(&b->wcs);
+               InitializeCriticalSection(&b->ics); b->used=1; InterlockedIncrement(&g_nbr); }
         LeaveCriticalSection(&g_brlk);
         if(b) logf_("open cable h=%p%s via %s",*ph,boot?" (BOOTLOADER, PID CC4B)":kind==3?" (TEST device)":"",b->winusb?"WinUSB (bridged)":"vendor driver (filtered)"); else logf_("open cable: no free bridge slot");
     }
@@ -297,9 +307,7 @@ static NTSTATUS NTAPI hRead(HANDLE h,HANDLE ev,PVOID apc,PVOID ctx,IOSB *io,PVOI
     io->Information=0; io->Status=ST_PENDING; if(ev) ResetEvent(ev);
     if(b->pt) b->pt->next=p; else b->ph=p; b->pt=p;
     LeaveCriticalSection(&b->cs); leave_br(b); return ST_PENDING; }
-static int blocked_cmd(const unsigned char *d, ULONG n, char *why){
-    ULONG i=0; while(i<n && (d[i]=='\r'||d[i]=='\n')) i++;
-    char c[8]={0}; for(int k=0;k<6 && i+k<n;k++) c[k]=(char)tolower(d[i+k]);
+static int blocked_one(const char *c, char *why){
     if(g_testblock[0] && !strncmp(c,g_testblock,strlen(g_testblock))){ strcpy(why,"TestBlock"); return 1; }
     if(!g_block) return 0;
     if(!strncmp(c,"atx",3)){ strcpy(why,"enter bootloader (firmware update)"); return 1; }
@@ -316,6 +324,20 @@ static unsigned long att_short(const unsigned char *d, ULONG n){
     unsigned long ds=0; int dig=0; while(k<e && d[k]>='0' && d[k]<='9' && dig<6){ ds=ds*10+(unsigned long)(d[k]-'0'); k++; dig++; }
     if(!dig || ds>4128) return 0;
     ULONG carried=n-(e+1); return ds>carried ? ds-carried : 0; }
+
+static int scan_write(const unsigned char *d, ULONG n, char *why, unsigned long *att_left){
+    ULONG i=0; *att_left=0;
+    for(int line=0; line<64; line++){
+        while(i<n && (d[i]=='\r'||d[i]=='\n')) i++;
+        if(i>=n) return 0;
+        char c[8]={0}; for(int k=0;k<6 && i+k<n;k++) c[k]=(char)tolower(d[i+k]);
+        if(blocked_one(c,why)) return 1;
+        if(c[0]=='a' && c[1]=='t'){
+            if(c[2]=='t'){ *att_left=att_short(d+i,n-i); return 0; }
+            if(c[2]=='f'||c[2]=='m'||c[2]=='y'||c[2]=='p') return 0; }
+        else if(!(c[0]=='t' && c[1]=='b')) return 0;
+        while(i<n && d[i]!='\n') i++; }
+    return 0; }
 static NTSTATUS NTAPI hWrite(HANDLE h,HANDLE ev,PVOID apc,PVOID ctx,IOSB *io,PVOID buf,ULONG len,PLARGE_INTEGER off,PULONG key){
     Br *b=guarded()?NULL:enter_br(h); if(!b) return oWrite(h,ev,apc,ctx,io,buf,len,off,key);
     ev=(HANDLE)((ULONG_PTR)ev & ~(ULONG_PTR)1);
@@ -324,9 +346,9 @@ static NTSTATUS NTAPI hWrite(HANDLE h,HANDLE ev,PVOID apc,PVOID ctx,IOSB *io,PVO
     EnterCriticalSection(&b->wcs);
     if(b->att_left){ cont = len<b->att_left ? len : (ULONG)b->att_left; b->att_left-=cont;
         logf_("write continues att data: %lu B (%lu still to come)", (unsigned long)cont, b->att_left); }
-    if(cont<len) b->att_left=att_short(d+cont,len-cont);
+    int blk = cont<len && scan_write(d+cont,len-cont,why,&b->att_left);
     LeaveCriticalSection(&b->wcs);
-    if(cont<len && blocked_cmd(d+cont,len-cont,why)){ fmt_bytes(d,(int)len,pv,sizeof pv); b->nblocked++;
+    if(blk){ fmt_bytes(d,(int)len,pv,sizeof pv); b->nblocked++;
         logf_("*** BLOCKED (%s)%s: %s - not sent to the cable; reported as written",why,b->boot?" [cable in bootloader]":"",pv);
         io->Information=len; io->Status=ST_SUCCESS; if(ev) SetEvent(ev); leave_br(b); return ST_SUCCESS; }
     if(!init_session(b) || b->gone){ io->Information=0; io->Status=ST_NOT_CONNECTED; if(ev) SetEvent(ev); leave_br(b); return ST_NOT_CONNECTED; }
@@ -350,28 +372,36 @@ static NTSTATUS NTAPI hClose(HANDLE h){
     Br *b=NULL; if(!guarded()){ EnterCriticalSection(&g_brlk); b=find_br(h); if(b && InterlockedExchange(&b->stop,1)) b=NULL; LeaveCriticalSection(&g_brlk); }
     if(!b) return oClose(h);
     guard(1);
-    for(int i=0; b->inited==1 && i<5000; i++) Sleep(1);
     cancel_reads(b);
-    for(int i=0; b->busy && i<5000; i++){ cancel_reads(b); Sleep(1); }
+
+    for(int i=0; b->busy && i<5000; i++){ cancel_reads(b); if(i==100 && b->wuio) wu.AbortPipe(b->wuio,b->pout); Sleep(1); }
+    int ended = !b->busy;
     if(b->wuio){ wu.AbortPipe(b->wuio,b->pin); wu.AbortPipe(b->wuio,b->pout); }
-    int ended=1;
-    if(b->thread){ CancelIoEx(b->h,NULL); ended = WaitForSingleObject(b->thread,5000)==WAIT_OBJECT_0; CloseHandle(b->thread); }
-    if(!ended) logf_("WARNING: reader thread did not stop within 5 s; its buffers are kept (small leak) to stay safe");
-    else for(int i=0;i<NRD;i++){ DWORD g; if(b->rs[i].pend) GetOverlappedResult(b->h,&b->rs[i].ov,&g,TRUE); if(b->rs[i].ov.hEvent) CloseHandle(b->rs[i].ov.hEvent); }
-    if(b->wuassoc) wu.Free(b->wuassoc); if(b->wu0) wu.Free(b->wu0);
-    if(ended){ if(b->ovw.hEvent) CloseHandle(b->ovw.hEvent); if(b->ovr.hEvent) CloseHandle(b->ovr.hEvent); }
+    if(b->thread){ CancelIoEx(b->h,NULL); if(WaitForSingleObject(b->thread,5000)!=WAIT_OBJECT_0) ended=0; CloseHandle(b->thread); }
     if(b->inited>=2) logf_("close cable h=%p: %lu writes / %llu B, %lu reads served, %llu B received, %lu blocked%s",
                         h,b->nwrites,b->txbytes,b->nreads,b->rxbytes,b->nblocked,b->gone?", cable was removed":"");
     if(b->gone) InterlockedExchange(&g_clockset_done,0);
-    EnterCriticalSection(&g_brlk); b->used=0; LeaveCriticalSection(&g_brlk);
-    if(ended){ DeleteCriticalSection(&b->cs); DeleteCriticalSection(&b->wcs); }
+    if(!ended){
+
+        logf_("WARNING: the cable session did not stop within 5 s; its slot is retired (small leak) to stay safe");
+        EnterCriticalSection(&g_brlk); b->h=NULL; LeaveCriticalSection(&g_brlk);
+        guard(0); return oClose(h); }
+
+    if(b->wuio) wu.AbortPipe(b->wuio,b->pin);
+    for(int i=0;i<NRD;i++){ DWORD g;
+        if(b->rs[i].pend && b->rs[i].ov.hEvent && WaitForSingleObject(b->rs[i].ov.hEvent,2000)==WAIT_OBJECT_0) GetOverlappedResult(b->h,&b->rs[i].ov,&g,FALSE);
+        if(b->rs[i].ov.hEvent) CloseHandle(b->rs[i].ov.hEvent); }
+    if(b->wuassoc) wu.Free(b->wuassoc); if(b->wu0) wu.Free(b->wu0);
+    if(b->ovw.hEvent) CloseHandle(b->ovw.hEvent); if(b->ovr.hEvent) CloseHandle(b->ovr.hEvent);
+    EnterCriticalSection(&g_brlk); b->used=0; InterlockedDecrement(&g_nbr); LeaveCriticalSection(&g_brlk);
+    DeleteCriticalSection(&b->cs); DeleteCriticalSection(&b->wcs); DeleteCriticalSection(&b->ics);
     guard(0);
     return oClose(h); }
 
 #define MAXSTUB 1024
 static struct { char name[48]; unsigned char *stub; unsigned nargs; volatile LONG n; } g_s[MAXSTUB]; static int g_ns;
 void __cdecl other_pre(DWORD *a, DWORD idx){
-    if(guarded()) return; unsigned na=g_s[idx].nargs>12?12:g_s[idx].nargs; Br *b=NULL; int at=-1;
+    if(!g_nbr || guarded()) return; unsigned na=g_s[idx].nargs>12?12:g_s[idx].nargs; Br *b=NULL; int at=-1;
     for(unsigned k=0;k<na && !b;k++){ b=find_br((HANDLE)a[k]); at=(int)k; }
     if(!b) return;
     DWORD le=__readfsdword(0x34); guard(1);
@@ -421,7 +451,7 @@ static void read_ini(HINSTANCE hi){
     { char tp[64]; GetPrivateProfileStringA("bridge","TestPath","",tp,sizeof tp,p); _strlwr(tp);
       MultiByteToWideChar(CP_ACP,0,tp,-1,g_testpath,64); } }
 
-#define BRIDGE_VERSION "TactriFree EcuFlash bridge 0.11 (2026-11-08)"
+#define BRIDGE_VERSION "TactriFree EcuFlash bridge 1.0 beta3 (0.12, 2026-11-09)"
 __declspec(dllexport) const char * __cdecl TactriFreeBridgeVersion(void){ return BRIDGE_VERSION; }
 
 BOOL WINAPI DllMain(HINSTANCE hi, DWORD r, LPVOID rs){ (void)rs;

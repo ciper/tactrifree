@@ -1,4 +1,4 @@
-/* tactrifree 1.0 beta - SPDX-License-Identifier: GPL-3.0-or-later */
+/* tactrifree 1.0 beta3 - SPDX-License-Identifier: GPL-3.0-or-later */
 #define GLU_N 52
 static const char *g_glu_names[GLU_N] = {"gluBeginCurve","gluBeginPolygon","gluBeginSurface","gluBeginTrim","gluBuild1DMipmaps","gluBuild2DMipmaps","gluCylinder","gluDeleteNurbsRenderer","gluDeleteQuadric","gluDeleteTess","gluDisk","gluEndCurve","gluEndPolygon","gluEndSurface","gluEndTrim","gluErrorString","gluErrorUnicodeStringEXT","gluGetNurbsProperty","gluGetString","gluGetTessProperty","gluLoadSamplingMatrices","gluLookAt","gluNewNurbsRenderer","gluNewQuadric","gluNewTess","gluNextContour","gluNurbsCallback","gluNurbsCurve","gluNurbsProperty","gluNurbsSurface","gluOrtho2D","gluPartialDisk","gluPerspective","gluPickMatrix","gluProject","gluPwlCurve","gluQuadricCallback","gluQuadricDrawStyle","gluQuadricNormals","gluQuadricOrientation","gluQuadricTexture","gluScaleImage","gluSphere","gluTessBeginContour","gluTessBeginPolygon","gluTessCallback","gluTessEndContour","gluTessEndPolygon","gluTessNormal","gluTessProperty","gluTessVertex","gluUnProject"};
 static void *g_glu[GLU_N];

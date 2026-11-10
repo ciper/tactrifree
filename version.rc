@@ -1,0 +1,47 @@
+// tactrifree 1.0 beta3 - version resource of the three DLLs (file Properties > Details).
+// SPDX-License-Identifier: GPL-3.0-or-later
+// rc /dTF_KIND=1 -> tactrifree32.dll, 2 -> tactrifree64.dll, 3 -> glu32.dll (EcuFlash bridge)
+#include <winver.h>
+#define TF_VERSION      1,0,0,3
+#define TF_VERSION_STR  "1.0 beta3"
+#if TF_KIND == 1
+#define TF_FILE "tactrifree32.dll"
+#define TF_NAME "tactrifree32 1.0 beta3"
+#define TF_DESC "TactriFree J2534 driver for OpenPort 2.0 (32-bit)"
+#elif TF_KIND == 2
+#define TF_FILE "tactrifree64.dll"
+#define TF_NAME "tactrifree64 1.0 beta3"
+#define TF_DESC "TactriFree J2534 driver for OpenPort 2.0 (64-bit)"
+#else
+#define TF_FILE "glu32.dll"
+#define TF_NAME "tactrifree bridge 1.0 beta3"
+#define TF_DESC "TactriFree EcuFlash bridge"
+#endif
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     TF_VERSION
+PRODUCTVERSION  TF_VERSION
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       VS_FF_PRERELEASE
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_DLL
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName",      "TactriFree (open source)"
+            VALUE "FileDescription",  TF_DESC
+            VALUE "FileVersion",      TF_VERSION_STR
+            VALUE "InternalName",     TF_NAME
+            VALUE "LegalCopyright",   "GPL-3.0-or-later"
+            VALUE "OriginalFilename", TF_FILE
+            VALUE "ProductName",      "TactriFree"
+            VALUE "ProductVersion",   TF_VERSION_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

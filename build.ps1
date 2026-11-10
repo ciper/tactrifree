@@ -1,6 +1,6 @@
-﻿# tactrifree 1.0 beta - build (Visual Studio Build Tools, C) and package.
+﻿# tactrifree 1.0 beta3 - build (Visual Studio Build Tools, C) and package.
 #   .\build.ps1            -> out\x86\tactrifree32.dll, out\x64\tactrifree64.dll, out\bridge\glu32.dll
-#   .\build.ps1 -Package   -> also release\TactriFree-1.0-beta\ (+ .zip): the installer folder
+#   .\build.ps1 -Package   -> also release\TactriFree-1.0-beta3\ (+ .zip): the installer folder
 #                             (the WinUSB catalog is made with makecat from the Windows SDK; it is signed on the
 #                              installing PC by installer\TactriFree-Setup.ps1)
 # SPDX-License-Identifier: GPL-3.0-or-later
@@ -20,13 +20,15 @@ function Cl($vcvars, $outdir, $cmd){
     if($bad -or $LASTEXITCODE){ $o | Out-Host; throw "build failed in $outdir" }
 }
 $cf = '/nologo /LD /O2 /W3 /D_CRT_SECURE_NO_WARNINGS'
-Cl 'vcvars32.bat' "$root\out\x86"    "cl $cf `"$root\driver\tactrifree.c`" /Fe:tactrifree32.dll /link /DEF:`"$root\driver\tactrifree32.def`" setupapi.lib winmm.lib advapi32.lib"
-Cl 'vcvars64.bat' "$root\out\x64"    "cl $cf `"$root\driver\tactrifree.c`" /Fe:tactrifree64.dll /link /DEF:`"$root\driver\tactrifree64.def`" setupapi.lib winmm.lib advapi32.lib"
-Cl 'vcvars32.bat' "$root\out\bridge" "cl $cf /DAS_GLU32 `"$root\bridge\tactrifree_bridge.c`" /Fe:glu32.dll"
+# version.rc -> version.res (file Properties > Details): TF_KIND 1 = tactrifree32, 2 = tactrifree64, 3 = bridge
+$rc = 'rc /nologo /fo version.res'
+Cl 'vcvars32.bat' "$root\out\x86"    "$rc /dTF_KIND=1 `"$root\version.rc`" && cl $cf `"$root\driver\tactrifree.c`" version.res /Fe:tactrifree32.dll /link /DEF:`"$root\driver\tactrifree32.def`" setupapi.lib winmm.lib advapi32.lib"
+Cl 'vcvars64.bat' "$root\out\x64"    "$rc /dTF_KIND=2 `"$root\version.rc`" && cl $cf `"$root\driver\tactrifree.c`" version.res /Fe:tactrifree64.dll /link /DEF:`"$root\driver\tactrifree64.def`" setupapi.lib winmm.lib advapi32.lib"
+Cl 'vcvars32.bat' "$root\out\bridge" "$rc /dTF_KIND=3 `"$root\version.rc`" && cl $cf /DAS_GLU32 `"$root\bridge\tactrifree_bridge.c`" version.res /Fe:glu32.dll"
 Get-ChildItem "$root\out" -Recurse -Filter *.dll | ForEach-Object { 'built ' + $_.FullName }
 if(-not $Package){ return }
 
-$ver = '1.0-beta'
+$ver = '1.0-beta3'
 $rel = Join-Path $root "release\TactriFree-$ver"
 if(Test-Path $rel){ Remove-Item $rel -Recurse -Force }
 foreach($d in 'x86','x64','bridge','driver'){ New-Item -ItemType Directory -Force "$rel\$d" | Out-Null }

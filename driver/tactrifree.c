@@ -1,4 +1,4 @@
-/* tactrifree 1.0 beta - SPDX-License-Identifier: GPL-3.0-or-later */
+/* tactrifree 1.0 beta3 - SPDX-License-Identifier: GPL-3.0-or-later */
 #include <windows.h>
 #include <setupapi.h>
 #include <winusb.h>
@@ -13,7 +13,7 @@
 static const GUID OP2_IFACE = {0x6D1781B7,0xC987,0x4F6C,{0x8D,0x4F,0x1E,0xFC,0x09,0x8B,0xEA,0x67}};
 #endif
 
-#define PRODUCT     "TactriFree driver alpha v1.0"
+#define PRODUCT     "TactriFree driver 1.0 beta3"
 #define DLL_REPORT  "1.02.5000"
 #define API_REPORT  "04.04"
 
@@ -34,11 +34,15 @@ static long log_max(void){
     if(n>0 && n<sizeof buf){ long v=atol(buf); if(v>=1 && v<=1024) mb=v; }
     g_logmax=mb*1024*1024; return g_logmax;
 }
+
+static DWORD g_logfail, g_rotfail;
 static void log_open_locked(void){
     if(g_logf) return;
+    if(g_logfail && GetTickCount()-g_logfail<30000) return;
     char t[260]; if(!GetTempPathA(sizeof t,t)) return;
     char path[300]; _snprintf(path,sizeof path,"%s%s",t,OP20_LOG_NAME); path[sizeof path-1]=0;
-    g_logf=fopen(path,"ab"); if(g_logf){ fseek(g_logf,0,SEEK_END); g_logbytes=ftell(g_logf); }
+    g_logf=fopen(path,"ab");
+    if(g_logf){ fseek(g_logf,0,SEEK_END); g_logbytes=ftell(g_logf); g_logfail=0; } else g_logfail=GetTickCount()|1;
 }
 
 static void fmt_bytes(const unsigned char *b, int n, char *out, int outn){
@@ -62,12 +66,12 @@ static void dbg(const char *fmt, ...){
     log_open_locked();
     if(g_logf){
         fwrite(line,1,(size_t)ln,g_logf); fflush(g_logf); g_logbytes+=ln;
-        if(g_logbytes>log_max()){
+        if(g_logbytes>log_max() && (!g_rotfail || GetTickCount()-g_rotfail>60000)){
             fclose(g_logf); g_logf=NULL; g_logbytes=0;
             char t[260]; if(GetTempPathA(sizeof t,t)){ char path[300],oldp[320];
                 _snprintf(path,sizeof path,"%s%s",t,OP20_LOG_NAME); path[sizeof path-1]=0;
                 _snprintf(oldp,sizeof oldp,"%s%s.old",t,OP20_LOG_NAME); oldp[sizeof oldp-1]=0;
-                MoveFileExA(path,oldp,MOVEFILE_REPLACE_EXISTING); }
+                g_rotfail = MoveFileExA(path,oldp,MOVEFILE_REPLACE_EXISTING) ? 0 : (GetTickCount()|1); }
             log_open_locked();
         }
     }
@@ -93,10 +97,14 @@ static const char *errname(long c, char *buf, int n){
 }
 static void setlast(long code, const char *txt){
     EnterCriticalSection(&g_lock); g_lastcode=code; strncpy(g_lasterr,txt,sizeof g_lasterr-1); g_lasterr[sizeof g_lasterr-1]=0; LeaveCriticalSection(&g_lock); }
+static volatile LONG g_emptyrun;
 static long finish(long rc){
     if(t_keep){ t_keep=0; t_spec=NULL; return rc; }
     char b[40]; if(rc && t_spec && t_spec_code==rc) setlast(rc,t_spec); else setlast(rc,errname(rc,b,sizeof b));
-    if(rc) dbg("-> rc=%ld (%s)", rc, g_lasterr);
+
+    if(rc==ERR_BUFFER_EMPTY){ if(InterlockedIncrement(&g_emptyrun)<=3) dbg("-> rc=%ld (%s)", rc, g_lasterr); }
+    else { LONG k=InterlockedExchange(&g_emptyrun,0); if(k>3) dbg("   (%ld more empty reads not logged)", (long)(k-3));
+           if(rc) dbg("-> rc=%ld (%s)", rc, g_lasterr); }
     t_spec=NULL; return rc;
 }
 static long bad_chan(void){ spec(2,"invalid channel ID"); return 2; }
@@ -124,12 +132,12 @@ typedef struct Device {
     HANDLE thread; volatile LONG run;
     HMODULE selfref;
     volatile unsigned seqctr;
-    Reply *replies; CRITICAL_SECTION rlock; HANDLE revent;
+    Reply *replies; CRITICAL_SECTION rlock;
     CONDITION_VARIABLE rcv;
     CRITICAL_SECTION wlock;
-    unsigned char ring[0x4000]; volatile int rhead, rtail;
 
     int pend_len, pend_got; unsigned pend_seq; long pend_result; char pend_type; unsigned char pend_buf[REPLY_MAX];
+    DWORD pend_at;
 
     struct { RxMsg *head, *tail; int count; } rxq[10]; CRITICAL_SECTION qlock;
     CONDITION_VARIABLE qcv;
@@ -231,7 +239,12 @@ static int wu_issue(Device *d, int i){
 
 static int wu_read(Device *d, unsigned char *buf, DWORD n, DWORD ms){
     int total=0;
-    if(!d->rs[d->rnext].pend && !wu_issue(d,d->rnext)) return -1;
+
+    for(int k=0; k<WU_NREAD && !d->rs[d->rnext].pend; k++){
+        int i=d->rnext, others=0; for(int j=0;j<WU_NREAD;j++) others |= d->rs[j].pend;
+        if(!others){ if(!wu_issue(d,i)) return -1; break; }
+        wu_issue(d,i); d->rnext=(i+1)%WU_NREAD; }
+    if(!d->rs[d->rnext].pend) return -1;
     if(WaitForSingleObject(d->rs[d->rnext].ov.hEvent, ms)!=WAIT_OBJECT_0){
         return 0; }
     for(;;){
@@ -347,7 +360,7 @@ static void route_line(Device *d, const char *line, int len){
     if((type=='p' || type=='y') && nints>=3){
         int datalen=(int)vals[1];
         if(datalen>0){ d->pend_result=vals[0]; d->pend_seq=seq; d->pend_type=type;
-                       d->pend_len=datalen; d->pend_got=0; return; }
+                       d->pend_len=datalen; d->pend_got=0; d->pend_at=GetTickCount(); return; }
         push_reply(d, seq, vals[0], "", 0, type); return;
     }
 
@@ -449,6 +462,10 @@ static void enqueue_rx(Device *d, int internal, unsigned char status, const unsi
 static void parse_frames(Device *d){
     int i=0;
     while(i < d->fblen){
+
+        if(d->pend_len>0 && GetTickCount()-d->pend_at>3000){
+            dbg("RX: binary reply payload incomplete after 3 s (%d of %d B) - dropped", d->pend_got, d->pend_len);
+            d->pend_len=0; d->pend_got=0; }
         if(d->pend_len>0){
             int avail=d->fblen-i, need=d->pend_len-d->pend_got, take=avail<need?avail:need;
             int room=(int)sizeof d->pend_buf - d->pend_got; int keep = take<room ? take : (room>0?room:0);
@@ -497,7 +514,7 @@ static DWORD WINAPI reader_thread(void *arg){
     while(InterlockedCompareExchange(&d->run,1,1)){
         if(d->gone){ Sleep(50); continue; }
         int got = dev_read(d, buf, sizeof buf, 200);
-        if(got<0){ Sleep(5); continue; }
+        if(got<0){ if(d->run && !d->closing) Sleep(5); continue; }
         if(got==0) continue;
         if(d->fblen + got > (int)sizeof d->fb){
             int drop = d->fblen + got - (int)sizeof d->fb;
@@ -523,6 +540,8 @@ static HANDLE start_reader(Device *d){
     d->selfref=me;
     HANDLE t=CreateThread(NULL,0,reader_thread,d,0,NULL);
     if(!t && me){ FreeLibrary(me); d->selfref=NULL; }
+
+    if(t) SetThreadPriority(t, THREAD_PRIORITY_HIGHEST);
     return t;
 }
 
@@ -533,11 +552,11 @@ static long cmd_wait(Device *d, const char *cmd, int clen, unsigned seq, DWORD m
     for(;;){
         Reply *r=pop_reply(d, seq);
         if(!r){
-            if(d->gone){ spec(8,"device disconnected"); return ERR_DEVICE_NOT_CONNECTED; }
+            if(d->gone || d->used!=1){ spec(8,"device disconnected"); return ERR_DEVICE_NOT_CONNECTED; }
             double left=(double)ms-(now_ms()-t0);
             if(left<=0){ set_err("timeout waiting for device reply"); return ERR_TIMEOUT; }
             EnterCriticalSection(&d->rlock);
-            int have=d->gone; for(Reply *p=d->replies;p;p=p->next) if(seq==0||p->seq==seq){ have=1; break; }
+            int have=d->gone || d->used!=1; for(Reply *p=d->replies;p;p=p->next) if(seq==0||p->seq==seq){ have=1; break; }
             if(!have) SleepConditionVariableCS(&d->rcv,&d->rlock,(DWORD)(left+0.999));
             LeaveCriticalSection(&d->rlock);
             continue;
@@ -686,6 +705,21 @@ static int bootloader_present(void){
     return found;
 }
 
+static void log_cable_binding(void){
+    HDEVINFO di = SetupDiGetClassDevsA(NULL, "USB", NULL, DIGCF_PRESENT|DIGCF_ALLCLASSES);
+    if(di==INVALID_HANDLE_VALUE) return;
+    SP_DEVINFO_DATA dd; dd.cbSize=sizeof dd; int seen=0;
+    for(DWORD i=0; SetupDiEnumDeviceInfo(di,i,&dd); i++){
+        char ids[1024]={0}, svc[64]={0}; DWORD type=0;
+        if(!SetupDiGetDeviceRegistryPropertyA(di,&dd,SPDRP_HARDWAREID,&type,(BYTE*)ids,sizeof ids-2,NULL)) continue;
+        _strupr(ids); if(!strstr(ids,"VID_0403&PID_CC4")) continue;
+        if(!SetupDiGetDeviceRegistryPropertyA(di,&dd,SPDRP_SERVICE,&type,(BYTE*)svc,sizeof svc-1,NULL)) svc[0]=0;
+        dbg("Open: no usable cable; present: %s, Windows driver '%s'%s", ids, svc[0]?svc:"(none)",
+            _stricmp(svc,"WinUSB") ? " - not WinUSB: install the TactriFree driver package" : ""); seen++; }
+    SetupDiDestroyDeviceInfoList(di);
+    if(!seen) dbg("Open: no OpenPort 2.0 cable is plugged in");
+}
+
 static int probe_bootloader(Device *d){
     d->blen=0; d->bbuf[0]=0; InterlockedExchange(&d->bfound,0); InterlockedExchange(&d->bprobe,1);
     for(int t=0;t<3 && !d->bfound && !d->gone;t++){
@@ -707,16 +741,32 @@ static void teardown(Device *d){
     InterlockedExchange(&d->run,0); InterlockedExchange(&d->closing,1);
     if(d->wuio){ wu.AbortPipe(d->wuio,d->pin); wu.AbortPipe(d->wuio,d->pout); }
     if(d->h) CancelIoEx(d->h,NULL);
-    if(d->thread){ WaitForSingleObject(d->thread,2000); CloseHandle(d->thread); d->thread=NULL; }
+    if(d->thread){
+        int ended = WaitForSingleObject(d->thread,2000)==WAIT_OBJECT_0;
+        if(!ended){
+            if(d->wuio) wu.AbortPipe(d->wuio,d->pin);
+            if(d->h) CancelIoEx(d->h,NULL);
+            ended = WaitForSingleObject(d->thread,3000)==WAIT_OBJECT_0; }
+        CloseHandle(d->thread); d->thread=NULL;
+        if(!ended){
+
+            dbg("WARNING: reader thread did not stop within 5 s - device slot retired");
+            for(int c=0;c<MAX_CHANS;c++) d->chans[c].used=0;
+            InterlockedExchange(&d->gone,1); d->used=2;
+            WakeAllConditionVariable(&d->qcv); WakeAllConditionVariable(&d->rcv);
+            return; } }
+
+    if(d->wuio) wu.AbortPipe(d->wuio,d->pin);
     for(int i=0;i<WU_NREAD;i++){
-        DWORD g; if(d->rs[i].pend) GetOverlappedResult(d->h,&d->rs[i].ov,&g,TRUE); d->rs[i].pend=0;
+        DWORD g; if(d->rs[i].pend && d->rs[i].ov.hEvent && WaitForSingleObject(d->rs[i].ov.hEvent,2000)==WAIT_OBJECT_0)
+            GetOverlappedResult(d->h,&d->rs[i].ov,&g,FALSE);
+        d->rs[i].pend=0;
         if(d->rs[i].ov.hEvent){ CloseHandle(d->rs[i].ov.hEvent); d->rs[i].ov.hEvent=NULL; } }
     if(d->wuassoc){ wu.Free(d->wuassoc); d->wuassoc=NULL; }
     if(d->wu0){ wu.Free(d->wu0); d->wu0=NULL; }
     d->wuio=NULL;
     if(d->h){ CloseHandle(d->h); d->h=NULL; }
     if(d->ov_r.hEvent)CloseHandle(d->ov_r.hEvent); if(d->ov_w.hEvent)CloseHandle(d->ov_w.hEvent);
-    if(d->revent)CloseHandle(d->revent);
     { Reply*p=d->replies; while(p){Reply*n2=p->next;free(p);p=n2;} d->replies=NULL; }
     for(int q=0;q<10;q++) clear_q(d,q);
     d->used=0;
@@ -737,6 +787,7 @@ static long impl_Open(const void *pName, unsigned long *pDeviceID){
     if(!g_init){ InitializeCriticalSection(&g_lock); g_init=1; }
     char path[512]; int winusb=0;
     if(!find_device(0, path, sizeof path, &winusb)){
+        log_cable_binding();
         if(bootloader_present()){ spec(8,"stuck in bootloader"); return ERR_DEVICE_NOT_CONNECTED; }
         spec(8,"no devices available"); return ERR_DEVICE_NOT_CONNECTED; }
     int slot=-1;
@@ -749,7 +800,7 @@ static long impl_Open(const void *pName, unsigned long *pDeviceID){
     d->seqctr=1;
     d->progv=0xFFFFFFFFu;
     strncpy(d->path,path,sizeof d->path-1); d->winusb=winusb;
-    InitializeCriticalSection(&d->rlock); d->revent=CreateEvent(NULL,FALSE,FALSE,NULL);
+    InitializeCriticalSection(&d->rlock);
     InitializeCriticalSection(&d->qlock); InitializeConditionVariable(&d->qcv); InitializeConditionVariable(&d->rcv); InitializeCriticalSection(&d->wlock);
     if(!open_port(d)){ teardown(d); spec(8,"no devices available"); return ERR_DEVICE_NOT_CONNECTED; }
     d->run=1; d->thread=start_reader(d);
@@ -769,9 +820,9 @@ static long impl_Open(const void *pName, unsigned long *pDeviceID){
     dbg("PassThruOpen OK: dev=%u path=%s transport=%s", d->id, d->path, d->winusb?"WinUSB":"vendor driver");
     return STATUS_NOERROR;
 }
-static Device* dev_by_id(unsigned id){ for(int i=0;i<8;i++) if(g_dev[i].used && g_dev[i].id==id) return &g_dev[i]; return NULL; }
+static Device* dev_by_id(unsigned id){ for(int i=0;i<8;i++) if(g_dev[i].used==1 && g_dev[i].id==id) return &g_dev[i]; return NULL; }
 static Channel* chan_by_id(unsigned cid, Device **pd){
-    for(int i=0;i<8;i++) if(g_dev[i].used)
+    for(int i=0;i<8;i++) if(g_dev[i].used==1)
         for(int c=0;c<MAX_CHANS;c++) if(g_dev[i].chans[c].used && g_dev[i].chans[c].id==cid){ if(pd)*pd=&g_dev[i]; return &g_dev[i].chans[c]; }
     return NULL;
 }
@@ -794,7 +845,7 @@ static long impl_Connect(unsigned long DeviceID, unsigned long ProtocolID, unsig
     Device *d=dev_by_id(DeviceID); if(!d) return bad_dev();
     int slot=-1;
     EnterCriticalSection(&g_lock);
-    for(int c=0;c<MAX_CHANS;c++) if(!d->chans[c].used){ slot=c; d->chans[c].used=1; break; }
+    for(int c=0;c<MAX_CHANS;c++) if(!d->chans[c].used){ slot=c; d->chans[c].id=0; d->chans[c].used=1; break; }
     LeaveCriticalSection(&g_lock);
     if(slot<0) return ERR_EXCEEDED_LIMIT;
     Channel *ch=&d->chans[slot]; ch->id=0;
@@ -973,7 +1024,7 @@ static long impl_Ioctl(unsigned long ChannelID, unsigned long IoctlID, const voi
       case TX_IOCTL_GET_DEVICE_INSTANCES: t_keep=1; return get_device_instances(pOutput);
       case TX_IOCTL_APP_SERVICE: case READ_VBATT: case READ_PROG_VOLTAGE: case TX_IOCTL_SET_DEV_DEBUG_FLAGS:
           if(ChannelID==0){
-              for(int i=0;i<8;i++) if(g_dev[i].used){ t_keep=1; return STATUS_NOERROR; }
+              for(int i=0;i<8;i++) if(g_dev[i].used==1){ t_keep=1; return STATUS_NOERROR; }
               spec(8,"no device connected"); return ERR_DEVICE_NOT_CONNECTED; }
           d=dev_by_id(ChannelID);
           if(!d){ ch=chan_by_id(ChannelID,&d); if(!ch) return bad_chan(); }
@@ -1035,20 +1086,22 @@ static long impl_ReadMsgs(unsigned long ChannelID, void *pMsg, unsigned long *pN
     Device *d=NULL; Channel *ch=chan_by_id(ChannelID,&d); if(!ch) return bad_chan();
 
     int qs[2]={ (int)ch->internal, 5 }; int nq = (ch->internal==6) ? 2 : 1;
-    PASSTHRU_MSG *out=(PASSTHRU_MSG*)pMsg; unsigned long want=*pNumMsgs, n=0; double t0=now_ms();
+    PASSTHRU_MSG *out=(PASSTHRU_MSG*)pMsg; unsigned long want=*pNumMsgs, n=0; double t0=now_ms(); int nullbuf=0;
 
     EnterCriticalSection(&d->qlock);
     for(;;){
         int got_any=0;
+        if(!out){ for(int q=0;q<nq;q++) if(d->rxq[qs[q]].head) nullbuf=1; if(nullbuf) break; }
         for(int q=0;q<nq && n<want;q++){ RxMsg *rx=dequeue_locked(d,qs[q]); if(rx){ out[n++]=rx->msg; free(rx); got_any=1; } }
         if(n>=want) break;
         if(!got_any){
-            if(Timeout==0 || d->gone || !d->used) break;
+            if(Timeout==0 || d->gone || d->used!=1) break;
             double left=(double)Timeout-(now_ms()-t0); if(left<=0) break;
             SleepConditionVariableCS(&d->qcv,&d->qlock,(DWORD)(left+0.999));
         }
     }
     LeaveCriticalSection(&d->qlock);
+    if(nullbuf){ set_err("ReadMsgs: NULL message buffer"); return ERR_NULL_PARAMETER; }
     *pNumMsgs=n;
     if(n) dbg("ReadMsgs chan=%lu got=%lu (first proto=%lu size=%lu)", ChannelID, n,
               (unsigned long)out[0].ProtocolID, (unsigned long)out[0].DataSize);
