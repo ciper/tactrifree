@@ -34,7 +34,7 @@
 param([switch]$Uninstall, [switch]$Plan, [string]$EcuFlashDir = '', [switch]$SkipBridge, [switch]$SkipDriver,
       [switch]$RebindDriver, [string]$SandboxRoot = '', [switch]$NoPause)
 $ErrorActionPreference = 'Stop'
-$Version   = '1.0 beta3'
+$Version   = '1.0 beta4'
 $Here      = $PSScriptRoot
 $HwIds     = @('USB\VID_0403&PID_CC4D', 'USB\VID_0403&PID_CC4C&MI_00')   # the cable, and its composite form
 $GuidEf    = '{6D1781B7-C987-4F6C-8D4F-1EFC098BEA67}'     # interface ID EcuFlash's built-in library looks for

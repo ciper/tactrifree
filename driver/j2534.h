@@ -1,4 +1,4 @@
-/* tactrifree 1.0 beta3 - SPDX-License-Identifier: GPL-3.0-or-later */
+/* tactrifree 1.0 beta4 - SPDX-License-Identifier: GPL-3.0-or-later */
 #pragma once
 
 #define PASSTHRU_MSG_DATA_SIZE               4128

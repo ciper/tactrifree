@@ -1,4 +1,4 @@
-/* tactrifree 1.0 beta3 - SPDX-License-Identifier: GPL-3.0-or-later */
+/* tactrifree 1.0 beta4 - SPDX-License-Identifier: GPL-3.0-or-later */
 #include <windows.h>
 #include <setupapi.h>
 #include <winusb.h>
@@ -21,15 +21,17 @@ typedef struct { union { NTSTATUS Status; PVOID Pointer; }; ULONG_PTR Informatio
 #define ST_NOT_CONNECTED ((NTSTATUS)0xC000009DL)
 
 static char g_fakefw[16]="1.17.4869"; static int g_block=1;
+static int g_trace=1;
 static int g_blocknet=1; static volatile LONG g_netblocked;     static char g_testblock[16]="";
 static wchar_t g_testpath[64];
 
 static CRITICAL_SECTION g_loglk; static FILE *g_log; static char g_logpath[MAX_PATH]; static long g_logmax=8L<<20;
+static long g_logbytes;
 static LARGE_INTEGER g_qpf;
 static void log_open(void){
     char t[MAX_PATH]; GetTempPathA(MAX_PATH,t); _snprintf(g_logpath,MAX_PATH,"%stactrifree-bridge.log",t); g_logpath[MAX_PATH-1]=0;
     char e[16]; DWORD n=GetEnvironmentVariableA("TACTRIFREE_LOG_MB",e,sizeof e); if(n>0&&n<sizeof e){ long mb=atol(e); if(mb>=1&&mb<=1024) g_logmax=mb<<20; }
-    g_log=fopen(g_logpath,"ab"); }
+    g_log=fopen(g_logpath,"ab"); if(g_log){ fseek(g_log,0,SEEK_END); g_logbytes=ftell(g_log); } }
 static void logf_(const char *fmt, ...){
     char b[1200]; va_list ap; va_start(ap,fmt); _vsnprintf(b,sizeof b-1,fmt,ap); va_end(ap); b[sizeof b-1]=0;
     SYSTEMTIME s; GetLocalTime(&s);
@@ -37,9 +39,11 @@ static void logf_(const char *fmt, ...){
     if(g_log){
 
         static DWORD rotfail;
-        if(ftell(g_log)>g_logmax && (!rotfail || GetTickCount()-rotfail>60000)){ char old[MAX_PATH+8]; fclose(g_log); _snprintf(old,sizeof old,"%s.old",g_logpath); old[sizeof old-1]=0;
-            DeleteFileA(old); rotfail = MoveFileA(g_logpath,old) ? 0 : (GetTickCount()|1); g_log=fopen(g_logpath,"ab"); }
-        if(g_log){ fprintf(g_log,"%02d:%02d:%02d.%03d [%lu] %s\n",s.wHour,s.wMinute,s.wSecond,s.wMilliseconds,GetCurrentProcessId(),b); fflush(g_log); }
+        if(g_logbytes>g_logmax && (!rotfail || GetTickCount()-rotfail>60000)){ char old[MAX_PATH+8]; fclose(g_log); _snprintf(old,sizeof old,"%s.old",g_logpath); old[sizeof old-1]=0;
+            DeleteFileA(old); rotfail = MoveFileA(g_logpath,old) ? 0 : (GetTickCount()|1); g_log=fopen(g_logpath,"ab");
+            if(g_log){ fseek(g_log,0,SEEK_END); g_logbytes=ftell(g_log); } }
+        if(g_log){ int w=fprintf(g_log,"%02d:%02d:%02d.%03d [%lu] %s\n",s.wHour,s.wMinute,s.wSecond,s.wMilliseconds,GetCurrentProcessId(),b); fflush(g_log);
+                   if(w>0) g_logbytes+=w; }
     }
     LeaveCriticalSection(&g_loglk); }
 static void fmt_bytes(const unsigned char *d,int n,char *o,int cap){
@@ -92,6 +96,10 @@ typedef struct Br {
     int armed; DWORD armed_at; unsigned char line[160]; int linelen;
     unsigned long long rxbytes, txbytes; unsigned long nreads, nwrites, nblocked;
     unsigned long att_left;
+
+    unsigned char ob[640]; int oblen; unsigned long oskip;
+    int oseg_mid, ok_frames; unsigned long ok_bytes;
+    volatile LONG tr_t, tr_n, tr_skip;
 } Br;
 static Br g_br[8]; static CRITICAL_SECTION g_brlk;
 static volatile LONG g_nbr;
@@ -152,6 +160,63 @@ static void feed(Br *b, const unsigned char *d, int n){
             b->linelen=0;
         } } }
 
+#define TRACE_PER_S 300
+static int tr_ok(Br *b){
+    DWORD now=GetTickCount();
+    if(now-(DWORD)b->tr_t>=1000){ InterlockedExchange(&b->tr_t,(LONG)now); InterlockedExchange(&b->tr_n,0);
+        LONG k=InterlockedExchange(&b->tr_skip,0); if(k) logf_("   (%ld more traffic lines not logged)",(long)k); }
+    if(InterlockedIncrement(&b->tr_n)<=TRACE_PER_S) return 1;
+    InterlockedIncrement(&b->tr_skip); return 0; }
+static void hex32(const unsigned char *d,int n,char *o,int cap){
+    int k=0, m=n<32?n:32; for(int i=0;i<m && k<cap-8;i++) k+=_snprintf(o+k,cap-k,"%02X ",d[i]);
+    if(n>32 && k<cap-4){ o[k++]='.'; o[k++]='.'; } o[k<cap?k:cap-1]=0; }
+
+static void obs_frame(Br *b, const unsigned char *f){
+    int proto=f[2]-'0', dc=f[3]?f[3]-1:0; unsigned st=f[4]; char pv[120];
+    if(proto==6){
+        int mid=(st&0xD0)==0;
+        if(mid && ++b->oseg_mid>2) return;
+        if(tr_ok(b)){ hex32(f+5,dc,pv,sizeof pv);
+            if(!mid && b->oseg_mid>2) logf_("RX frame proto=6 len=%d st=0x%02X: %s (+%d middle segments not logged)",dc,st,pv,b->oseg_mid-2);
+            else logf_("RX frame proto=6 len=%d st=0x%02X: %s",dc,st,pv); }
+        if(!mid) b->oseg_mid=0;
+        return; }
+    if(proto==5){ if(tr_ok(b)){ hex32(f+5,dc,pv,sizeof pv); logf_("RX frame proto=5 len=%d st=0x%02X: %s",dc,st,pv); } return; }
+    if((st&0x80) && dc==4){ b->ok_frames=0; b->ok_bytes=0; return; }
+    if((st&0x40) && dc==4){
+        if(tr_ok(b)) logf_("RX message proto=%d st=0x%02X: %lu B in %d data frames%s",proto,st,b->ok_bytes,b->ok_frames,b->ok_frames>2?" (first 2 shown)":"");
+        b->ok_frames=0; b->ok_bytes=0; return; }
+    b->ok_bytes+=(unsigned long)dc;
+    if(++b->ok_frames<=2 && tr_ok(b)){ hex32(f+5,dc,pv,sizeof pv); logf_("RX frame proto=%d len=%d st=0x%02X: %s",proto,dc,st,pv); } }
+
+static void obs_line(Br *b, const char *l, int n){
+    long v[8]; int nv=0, st=-1;
+    for(int i=0;i<n;i++){ if(l[i]>='0'&&l[i]<='9'){ if(st<0) st=i; } else if(st>=0){ if(nv<8) v[nv++]=atol(l+st); st=-1; } }
+    if(st>=0 && nv<8) v[nv++]=atol(l+st);
+    unsigned long data=0; if(n>=3 && (l[2]=='p'||l[2]=='y') && nv>=3 && v[1]>0) data=(unsigned long)v[1];
+    b->oskip=data;
+    if(tr_ok(b)){ if(data) logf_("RX: %.*s (+%lu B data)",n>150?150:n,l,data); else logf_("RX: %.*s",n>150?150:n,l); } }
+
+static void observe(Br *b, const unsigned char *d, int n){
+    while(n>0){
+        int room=(int)sizeof b->ob-b->oblen, k=n<room?n:room; memcpy(b->ob+b->oblen,d,k); b->oblen+=k; d+=k; n-=k;
+        int i=0;
+        for(;;){
+            int av=b->oblen-i; if(av<=0) break;
+            if(b->oskip){ int z=(unsigned long)av<b->oskip?av:(int)b->oskip; b->oskip-=(unsigned long)z; i+=z; continue; }
+            if(av<3) break;
+            if(b->ob[i]!='a' || b->ob[i+1]!='r'){ int j=i+1; while(j<b->oblen && b->ob[j]!='a') j++;
+                if(tr_ok(b)){ char pv[120]; hex32(b->ob+i,j-i,pv,sizeof pv); logf_("RX unknown[%d]: %s",j-i,pv); }
+                i=j; continue; }
+            unsigned char t=b->ob[i+2];
+            if(t>='3' && t<='9'){ if(av<5) break; int dc=b->ob[i+3]?b->ob[i+3]-1:0; if(av<5+dc) break; obs_frame(b,b->ob+i); i+=5+dc; }
+            else { int nl=-1; for(int j=i+2;j<b->oblen;j++) if(b->ob[j]=='\n'){ nl=j; break; }
+                if(nl<0) break;
+                int ll=nl-i; if(ll>0 && b->ob[nl-1]=='\r') ll--;
+                obs_line(b,(const char*)b->ob+i,ll); i=nl+1; } }
+        if(i>0){ memmove(b->ob,b->ob+i,(size_t)(b->oblen-i)); b->oblen-=i; }
+        else if(b->oblen==(int)sizeof b->ob){ if(tr_ok(b)) logf_("RX: %d B without a line end - not shown",b->oblen); b->oblen=0; } } }
+
 static void release_stale(Br *b){
     EnterCriticalSection(&b->cs);
     if(b->armed && GetTickCount()-b->armed_at>2000){ ring_put(b,b->line,b->linelen); b->linelen=0; b->armed=0; serve(b); }
@@ -179,6 +244,7 @@ static DWORD WINAPI reader(void *arg){
                 wu_issue(b,i); b->rnext=(i+1)%NRD; continue; }
             errs=0;
             EnterCriticalSection(&b->cs); feed(b,b->rs[i].b,(int)got); serve(b); LeaveCriticalSection(&b->cs);
+            if(g_trace) observe(b,b->rs[i].b,(int)got);
             wu_issue(b,i); b->rnext=(i+1)%NRD;
         }
     } else {
@@ -189,6 +255,7 @@ static DWORD WINAPI reader(void *arg){
             if(st==ST_PENDING){ while(!b->stop && WaitForSingleObject(b->ovr.hEvent,200)!=WAIT_OBJECT_0) release_stale(b); if(b->stop) break; st=b->riosb.Status; }
             if(st<0){ if(b->stop) break; logf_("read status 0x%08lX on the vendor driver: cable removed?",(unsigned long)st); InterlockedExchange(&b->gone,1); break; }
             EnterCriticalSection(&b->cs); feed(b,b->rbuf,(int)b->riosb.Information); serve(b); LeaveCriticalSection(&b->cs);
+            if(g_trace) observe(b,b->rbuf,(int)b->riosb.Information);
         }
     }
     EnterCriticalSection(&b->cs); if(b->gone) fail_all(b,ST_NOT_CONNECTED); LeaveCriticalSection(&b->cs);
@@ -355,8 +422,13 @@ static NTSTATUS NTAPI hWrite(HANDLE h,HANDLE ev,PVOID apc,PVOID ctx,IOSB *io,PVO
     for(ULONG i=cont;i+3<=len && i<cont+12;i++) if(d[i]=='a'&&d[i+1]=='t'&&d[i+2]=='i'&&(i+3==len||d[i+3]=='\r'||d[i+3]=='\n')){
         EnterCriticalSection(&b->cs); b->armed=1; b->armed_at=GetTickCount(); b->linelen=0; LeaveCriticalSection(&b->cs); break; }
     b->nwrites++; b->txbytes+=len;
-    if(!b->winusb){ NTSTATUS st=oWrite(h,ev,apc,ctx,io,buf,len,off,key); leave_br(b); return st; }
-    guard(1); EnterCriticalSection(&b->wcs); int w=wu_send(b,buf,len); LeaveCriticalSection(&b->wcs); guard(0);
+    if(g_trace && cont<len) fmt_bytes(d+cont,(int)(len-cont),pv,sizeof pv);
+    if(!b->winusb){ NTSTATUS st=oWrite(h,ev,apc,ctx,io,buf,len,off,key);
+        if(g_trace && cont<len){ guard(1); if(tr_ok(b)) logf_("TX[%lu]: %s",(unsigned long)(len-cont),pv); guard(0); }
+        leave_br(b); return st; }
+    guard(1); EnterCriticalSection(&b->wcs); int w=wu_send(b,buf,len); LeaveCriticalSection(&b->wcs);
+    if(g_trace && cont<len && tr_ok(b)) logf_("TX[%lu]: %s",(unsigned long)(len-cont),pv);
+    guard(0);
     if(w<0){ if(w==-1) InterlockedExchange(&b->gone,1); io->Information=0; io->Status=w==-2?(NTSTATUS)0xC00000B5L:ST_NOT_CONNECTED; if(ev) SetEvent(ev); leave_br(b); return io->Status; }
     io->Information=(ULONG)w; io->Status=ST_SUCCESS; if(ev) SetEvent(ev); leave_br(b); return ST_SUCCESS; }
 static void cancel_reads(Br *b){ EnterCriticalSection(&b->cs); fail_all(b,ST_CANCELLED); LeaveCriticalSection(&b->cs); }
@@ -380,6 +452,7 @@ static NTSTATUS NTAPI hClose(HANDLE h){
     if(b->thread){ CancelIoEx(b->h,NULL); if(WaitForSingleObject(b->thread,5000)!=WAIT_OBJECT_0) ended=0; CloseHandle(b->thread); }
     if(b->inited>=2) logf_("close cable h=%p: %lu writes / %llu B, %lu reads served, %llu B received, %lu blocked%s",
                         h,b->nwrites,b->txbytes,b->nreads,b->rxbytes,b->nblocked,b->gone?", cable was removed":"");
+    { LONG k=InterlockedExchange(&b->tr_skip,0); if(k) logf_("   (%ld more traffic lines not logged)",(long)k); }
     if(b->gone) InterlockedExchange(&g_clockset_done,0);
     if(!ended){
 
@@ -447,11 +520,12 @@ static void read_ini(HINSTANCE hi){
     if(strlen(v)>=5 && strlen(v)<15) strcpy(g_fakefw,v);
     g_block=GetPrivateProfileIntA("bridge","BlockFirmware",1,p)!=0;
     g_blocknet=GetPrivateProfileIntA("bridge","BlockInternet",1,p)!=0;
+    g_trace=GetPrivateProfileIntA("bridge","LogTraffic",1,p)!=0;
     GetPrivateProfileStringA("bridge","TestBlock","",g_testblock,sizeof g_testblock,p); _strlwr(g_testblock);
     { char tp[64]; GetPrivateProfileStringA("bridge","TestPath","",tp,sizeof tp,p); _strlwr(tp);
       MultiByteToWideChar(CP_ACP,0,tp,-1,g_testpath,64); } }
 
-#define BRIDGE_VERSION "TactriFree EcuFlash bridge 1.0 beta3 (0.12, 2026-11-09)"
+#define BRIDGE_VERSION "TactriFree EcuFlash bridge 1.0 beta4 (0.13, 2026-11-11)"
 __declspec(dllexport) const char * __cdecl TactriFreeBridgeVersion(void){ return BRIDGE_VERSION; }
 
 BOOL WINAPI DllMain(HINSTANCE hi, DWORD r, LPVOID rs){ (void)rs;
@@ -474,8 +548,8 @@ BOOL WINAPI DllMain(HINSTANCE hi, DWORD r, LPVOID rs){ (void)rs;
         char host[MAX_PATH]; GetModuleFileNameA(NULL,host,MAX_PATH);
         if(g_tls>=64){ logf_("TactriFree bridge: TLS slot unavailable - bridge NOT active in %s",host); return TRUE; }
         int n=install();
-        logf_("==== %s attach: %s | hooks %d | firmware reported '%s' | firmware block %s | internet block %s%s%s ====",
-              BRIDGE_VERSION,host,n,g_fakefw,g_block?"ON":"OFF",g_blocknet?"ON":"OFF",g_testblock[0]?" | TestBlock=":"",g_testblock);
+        logf_("==== %s attach: %s | hooks %d | firmware reported '%s' | firmware block %s | internet block %s | traffic log %s%s%s ====",
+              BRIDGE_VERSION,host,n,g_fakefw,g_block?"ON":"OFF",g_blocknet?"ON":"OFF",g_trace?"ON":"OFF",g_testblock[0]?" | TestBlock=":"",g_testblock);
         if(n<=0) logf_("hooks NOT installed - EcuFlash runs unbridged");
     }
     return TRUE; }

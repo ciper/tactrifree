@@ -1,4 +1,4 @@
-/* tactrifree 1.0 beta3 - SPDX-License-Identifier: GPL-3.0-or-later */
+/* tactrifree 1.0 beta4 - SPDX-License-Identifier: GPL-3.0-or-later */
 #include <windows.h>
 #include <setupapi.h>
 #include <winusb.h>
@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include "j2534.h"
 
 #ifndef GUID_SEXPR
@@ -13,7 +14,7 @@
 static const GUID OP2_IFACE = {0x6D1781B7,0xC987,0x4F6C,{0x8D,0x4F,0x1E,0xFC,0x09,0x8B,0xEA,0x67}};
 #endif
 
-#define PRODUCT     "TactriFree driver 1.0 beta3"
+#define PRODUCT     "TactriFree driver 1.0 beta4"
 #define DLL_REPORT  "1.02.5000"
 #define API_REPORT  "04.04"
 
@@ -114,6 +115,7 @@ static long bad_dev(void){ spec(26,"invalid device ID"); return 26; }
 typedef struct Reply { struct Reply *next; unsigned seq; long result; char text[REPLY_MAX]; int tlen; char rtype; DWORD born; } Reply;
 
 typedef struct RxMsg { struct RxMsg *next; PASSTHRU_MSG msg; } RxMsg;
+#define RXMSG_SIZE(len) (offsetof(RxMsg,msg.Data)+(size_t)(len))
 
 typedef struct Channel {
     int used; unsigned id; unsigned protocol; unsigned internal; unsigned flags; unsigned baud;
@@ -139,11 +141,14 @@ typedef struct Device {
     int pend_len, pend_got; unsigned pend_seq; long pend_result; char pend_type; unsigned char pend_buf[REPLY_MAX];
     DWORD pend_at;
 
-    struct { RxMsg *head, *tail; int count; } rxq[10]; CRITICAL_SECTION qlock;
+    struct { RxMsg *head, *tail; int count; size_t bytes; } rxq[10]; CRITICAL_SECTION qlock;
+    long rxdrop; DWORD rxdrop_t;
     CONDITION_VARIABLE qcv;
 
     unsigned char fb[0x4400]; int fblen;
     int seg_mid;
+    volatile LONG canlog_t, canlog_n, canlog_skip;
+    volatile unsigned canq_seq;
     struct { unsigned char buf[0x1021]; int len; } iso;
 
     struct { unsigned char buf[0x1008]; int len; unsigned ts; } kacc[10];
@@ -183,6 +188,18 @@ static unsigned long tx_timeout_us(unsigned pid, unsigned long us){
     }
 }
 
+#define CANLOG_PER_S 20
+static void can_log_note(Device *d){
+    LONG k=InterlockedExchange(&d->canlog_skip,0);
+    if(k) dbg("   (raw CAN: %ld more frames/reads/writes not logged)", (long)k);
+}
+static int can_log_ok(Device *d){
+    DWORD now=GetTickCount();
+    if(now-(DWORD)d->canlog_t>=1000){ InterlockedExchange(&d->canlog_t,(LONG)now); InterlockedExchange(&d->canlog_n,0); can_log_note(d); }
+    if(InterlockedIncrement(&d->canlog_n)<=CANLOG_PER_S) return 1;
+    InterlockedIncrement(&d->canlog_skip); return 0;
+}
+static __declspec(thread) int t_quiet;
 static unsigned next_seq(Device *d){
     unsigned s = (unsigned)InterlockedIncrement((LONG*)&d->seqctr);
     if(s > 0xFFFF){ d->seqctr = 1; s = 1; }
@@ -194,10 +211,16 @@ static int removal_error(DWORD e){
            e==ERROR_BROKEN_PIPE || e==ERROR_PIPE_NOT_CONNECTED || e==ERROR_NO_SUCH_DEVICE || e==ERROR_DEVICE_REMOVED ||
            e==ERROR_FILE_NOT_FOUND || e==ERROR_ACCESS_DENIED;
 }
+
+static void wake_waiters(struct Device *d);
 static void mark_gone(Device *d, DWORD e){
     if(InterlockedExchange(&d->gone,1)) return;
     dbg("cable removed (I/O error %lu)", (unsigned long)e);
-    WakeAllConditionVariable(&d->rcv); WakeAllConditionVariable(&d->qcv);
+    wake_waiters(d);
+}
+static void wake_waiters(Device *d){
+    EnterCriticalSection(&d->rlock); LeaveCriticalSection(&d->rlock); WakeAllConditionVariable(&d->rcv);
+    EnterCriticalSection(&d->qlock); LeaveCriticalSection(&d->qlock); WakeAllConditionVariable(&d->qcv);
 }
 
 static struct {
@@ -275,7 +298,7 @@ static int wu_read(Device *d, unsigned char *buf, DWORD n, DWORD ms){
 
 static DWORD write_budget_ms(DWORD n){ return 2000 + n*10*1000/1200; }
 static int dev_write(Device *d, const void *buf, DWORD n){
-    { char pv[220]; fmt_bytes((const unsigned char*)buf,(int)n,pv,sizeof pv); dbg("TX[%lu]: %s",(unsigned long)n,pv); }
+    if(!t_quiet){ char pv[220]; fmt_bytes((const unsigned char*)buf,(int)n,pv,sizeof pv); dbg("TX[%lu]: %s",(unsigned long)n,pv); }
 
     EnterCriticalSection(&d->wlock);
     DWORD wrote=0; int ok=1; ResetEvent(d->ov_w.hEvent);
@@ -343,10 +366,9 @@ static Reply* pop_reply(Device *d, unsigned seq){
 
 static void route_line(Device *d, const char *line, int len){
     if(len<2 || line[0]!='a' || line[1]!='r') return;
-    dbg("RX: %.*s", len, line);
     char type = len>=3 ? line[2] : 0;
 
-    if(type=='i'){ push_reply(d, 0x10000001u, 0, line, len, 'i'); return; }
+    if(type=='i'){ dbg("RX: %.*s", len, line); push_reply(d, 0x10000001u, 0, line, len, 'i'); return; }
 
     int i, laststart=-1, nints=0; long vals[8];
     for(i=0;i<len;i++){
@@ -354,6 +376,9 @@ static void route_line(Device *d, const char *line, int len){
         else { if(laststart>=0){ if(nints<8) vals[nints++]=atol(line+laststart); laststart=-1; } }
     }
     if(laststart>=0 && nints<8) vals[nints++]=atol(line+laststart);
+
+    if(type=='o' && nints>=1 && d->canq_seq && (unsigned)vals[nints-1]==d->canq_seq) d->canq_seq=0;
+    else dbg("RX: %.*s", len, line);
     if(nints<1) return;
     unsigned seq=(unsigned)vals[nints-1];
 
@@ -369,27 +394,34 @@ static void route_line(Device *d, const char *line, int len){
     { long result = nints>=2 ? vals[0] : 0; push_reply(d, seq, result, line, len, type); }
 }
 
-#define RXQ_CAP 4096
+#define RXQ_BYTES ((size_t)16<<20)
 static void enqueue_q(Device *d, int internal, unsigned rxstatus, unsigned ts, const unsigned char *data, int len, int extra){
     if(internal<0 || internal>9) return; if(len<0) len=0; if(len>4128) len=4128;
-    RxMsg *rx=(RxMsg*)calloc(1,sizeof *rx); if(!rx) return;
+    RxMsg *rx=(RxMsg*)malloc(RXMSG_SIZE(len)); if(!rx) return;
+    rx->next=NULL; rx->msg.TxFlags=0;
 
     rx->msg.ProtocolID=(unsigned)internal; rx->msg.RxStatus=rxstatus; rx->msg.DataSize=(unsigned)len;
     rx->msg.Timestamp=ts; rx->msg.ExtraDataIndex=(unsigned)extra;
     if(len) memcpy(rx->msg.Data, data, len);
     EnterCriticalSection(&d->qlock);
-    if(d->rxq[internal].count>=RXQ_CAP){ RxMsg *o=d->rxq[internal].head;
-        d->rxq[internal].head=o->next; if(!d->rxq[internal].head) d->rxq[internal].tail=NULL; d->rxq[internal].count--; free(o); }
+    while(d->rxq[internal].head && d->rxq[internal].bytes+RXMSG_SIZE(len)>RXQ_BYTES){
+        RxMsg *o=d->rxq[internal].head;
+        d->rxq[internal].head=o->next; if(!d->rxq[internal].head) d->rxq[internal].tail=NULL;
+        d->rxq[internal].count--; d->rxq[internal].bytes-=RXMSG_SIZE(o->msg.DataSize); free(o); d->rxdrop++; }
     if(d->rxq[internal].tail) d->rxq[internal].tail->next=rx; else d->rxq[internal].head=rx;
-    d->rxq[internal].tail=rx; d->rxq[internal].count++;
+    d->rxq[internal].tail=rx; d->rxq[internal].count++; d->rxq[internal].bytes+=RXMSG_SIZE(len);
     LeaveCriticalSection(&d->qlock);
     WakeAllConditionVariable(&d->qcv);
+    if(d->rxdrop && GetTickCount()-d->rxdrop_t>=1000){
+        dbg("RX queue of protocol %d is full (the program is not reading its messages): %ld oldest message(s) dropped", internal, d->rxdrop);
+        d->rxdrop=0; d->rxdrop_t=GetTickCount(); }
 }
 
 static RxMsg* dequeue_locked(Device *d, int internal){
     RxMsg *rx=NULL;
     if(internal>=0 && internal<=9 && d->rxq[internal].head){ rx=d->rxq[internal].head;
-        d->rxq[internal].head=rx->next; if(!rx->next) d->rxq[internal].tail=NULL; d->rxq[internal].count--; }
+        d->rxq[internal].head=rx->next; if(!rx->next) d->rxq[internal].tail=NULL; d->rxq[internal].count--;
+        d->rxq[internal].bytes-=RXMSG_SIZE(rx->msg.DataSize); }
     return rx;
 }
 
@@ -397,7 +429,7 @@ static void clear_q(Device *d, int internal){
     if(internal<0 || internal>9) return;
     EnterCriticalSection(&d->qlock);
     { RxMsg *p=d->rxq[internal].head; while(p){ RxMsg *n2=p->next; free(p); p=n2; } }
-    d->rxq[internal].head=d->rxq[internal].tail=NULL; d->rxq[internal].count=0;
+    d->rxq[internal].head=d->rxq[internal].tail=NULL; d->rxq[internal].count=0; d->rxq[internal].bytes=0;
     LeaveCriticalSection(&d->qlock);
 }
 
@@ -492,6 +524,7 @@ static void parse_frames(Device *d){
 
             int mid = (type=='6' && (status&0xD0)==0);
             if(mid && ++d->seg_mid>2){   }
+            else if(type=='5' && !can_log_ok(d)){   }
             else { char pv[140]; fmt_bytes(d->fb+i+5, dcount<32?dcount:32, pv, sizeof pv);
               if(!mid && d->seg_mid>2) dbg("RX frame proto=%d len=%d st=0x%02X: %s (+%d middle segments not logged)",
                                            type-0x30, dcount, (unsigned)status, pv, d->seg_mid-2);
@@ -509,6 +542,22 @@ static void parse_frames(Device *d){
     }
     if(i>0){ if(i<d->fblen) memmove(d->fb, d->fb+i, d->fblen-i); d->fblen-=i; }
 }
+
+static void reader_feed(Device *d, const unsigned char *buf, int got){
+    if(d->fblen + got > (int)sizeof d->fb){
+        int drop = d->fblen + got - (int)sizeof d->fb;
+        if(drop>d->fblen) drop=d->fblen;
+        memmove(d->fb, d->fb+drop, d->fblen-drop); d->fblen-=drop;
+    }
+    if(d->bprobe){
+        int room=(int)sizeof d->bbuf-1-d->blen, k=got<room?got:room;
+        if(k>0){ memcpy(d->bbuf+d->blen,buf,k); d->blen+=k; d->bbuf[d->blen]=0; }
+        for(int z=0;z<d->blen;z++) if(!d->bbuf[z]) d->bbuf[z]=' ';
+        if(strstr(d->bbuf,"bootloader")){ InterlockedExchange(&d->bfound,1); wake_waiters(d); }
+    }
+    memcpy(d->fb+d->fblen, buf, got); d->fblen+=got;
+    parse_frames(d);
+}
 static DWORD WINAPI reader_thread(void *arg){
     Device *d=(Device*)arg; unsigned char buf[2048];
     while(InterlockedCompareExchange(&d->run,1,1)){
@@ -516,19 +565,7 @@ static DWORD WINAPI reader_thread(void *arg){
         int got = dev_read(d, buf, sizeof buf, 200);
         if(got<0){ if(d->run && !d->closing) Sleep(5); continue; }
         if(got==0) continue;
-        if(d->fblen + got > (int)sizeof d->fb){
-            int drop = d->fblen + got - (int)sizeof d->fb;
-            if(drop>d->fblen) drop=d->fblen;
-            memmove(d->fb, d->fb+drop, d->fblen-drop); d->fblen-=drop;
-        }
-        if(d->bprobe){
-            int room=(int)sizeof d->bbuf-1-d->blen, k=got<room?got:room;
-            if(k>0){ memcpy(d->bbuf+d->blen,buf,k); d->blen+=k; d->bbuf[d->blen]=0; }
-            for(int z=0;z<d->blen;z++) if(!d->bbuf[z]) d->bbuf[z]=' ';
-            if(strstr(d->bbuf,"bootloader")){ InterlockedExchange(&d->bfound,1); WakeAllConditionVariable(&d->rcv); }
-        }
-        memcpy(d->fb+d->fblen, buf, got); d->fblen+=got;
-        parse_frames(d);
+        reader_feed(d, buf, got);
     }
 
     if(d->selfref) FreeLibraryAndExitThread(d->selfref, 0);
@@ -630,7 +667,8 @@ static int find_kernel_device(int index, char *path, int pathlen){
     SP_DEVICE_INTERFACE_DATA ifd; ifd.cbSize=sizeof ifd; int found=0, k=0;
     for(DWORD i=0; SetupDiEnumDeviceInterfaces(di,NULL,&OP2_IFACE,i,&ifd); i++){
         DWORD need=0; SetupDiGetDeviceInterfaceDetailA(di,&ifd,NULL,0,&need,NULL);
-        PSP_DEVICE_INTERFACE_DETAIL_DATA_A det=(PSP_DEVICE_INTERFACE_DETAIL_DATA_A)malloc(need);
+        if(need<sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_A)) continue;
+        PSP_DEVICE_INTERFACE_DETAIL_DATA_A det=(PSP_DEVICE_INTERFACE_DETAIL_DATA_A)malloc(need); if(!det) continue;
         det->cbSize=sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_A);
         SP_DEVINFO_DATA dd; dd.cbSize=sizeof dd;
         if(SetupDiGetDeviceInterfaceDetailA(di,&ifd,det,need,NULL,&dd)){
@@ -670,7 +708,8 @@ static int find_winusb_device(int index, char *path, int pathlen){
         SP_DEVICE_INTERFACE_DATA ifd; ifd.cbSize=sizeof ifd;
         for(DWORD j=0; !found && SetupDiEnumDeviceInterfaces(d2,NULL,&g,j,&ifd); j++){
             DWORD need=0; SP_DEVINFO_DATA idd; idd.cbSize=sizeof idd; SetupDiGetDeviceInterfaceDetailA(d2,&ifd,NULL,0,&need,NULL);
-            PSP_DEVICE_INTERFACE_DETAIL_DATA_A det=(PSP_DEVICE_INTERFACE_DETAIL_DATA_A)malloc(need);
+            if(need<sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_A)) continue;
+            PSP_DEVICE_INTERFACE_DETAIL_DATA_A det=(PSP_DEVICE_INTERFACE_DETAIL_DATA_A)malloc(need); if(!det) continue;
             det->cbSize=sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_A);
             if(SetupDiGetDeviceInterfaceDetailA(d2,&ifd,det,need,NULL,&idd) && idd.DevInst==dd.DevInst){
                 strncpy(path,det->DevicePath,pathlen-1); path[pathlen-1]=0; found=1; }
@@ -753,7 +792,7 @@ static void teardown(Device *d){
             dbg("WARNING: reader thread did not stop within 5 s - device slot retired");
             for(int c=0;c<MAX_CHANS;c++) d->chans[c].used=0;
             InterlockedExchange(&d->gone,1); d->used=2;
-            WakeAllConditionVariable(&d->qcv); WakeAllConditionVariable(&d->rcv);
+            wake_waiters(d);
             return; } }
 
     if(d->wuio) wu.AbortPipe(d->wuio,d->pin);
@@ -770,7 +809,7 @@ static void teardown(Device *d){
     { Reply*p=d->replies; while(p){Reply*n2=p->next;free(p);p=n2;} d->replies=NULL; }
     for(int q=0;q<10;q++) clear_q(d,q);
     d->used=0;
-    WakeAllConditionVariable(&d->qcv); WakeAllConditionVariable(&d->rcv);
+    wake_waiters(d);
 }
 
 static volatile LONG g_next_dev = 1;
@@ -829,6 +868,7 @@ static Channel* chan_by_id(unsigned cid, Device **pd){
 
 static long impl_Close(unsigned long DeviceID){
     Device *d=dev_by_id(DeviceID); if(!d) return bad_dev();
+    can_log_note(d);
     dbg("PassThruClose dev=%lu", DeviceID);
 
     for(int c=0;c<MAX_CHANS;c++) if(d->chans[c].used){
@@ -1052,7 +1092,8 @@ static unsigned eff_proto(const Channel *ch, unsigned long msgproto){
 static long impl_WriteMsgs(unsigned long ChannelID, const void *pMsg, unsigned long *pNumMsgs, unsigned long Timeout){
     Device *d=NULL; Channel *ch=chan_by_id(ChannelID,&d); if(!ch) return bad_chan();
     const PASSTHRU_MSG *m=(const PASSTHRU_MSG*)pMsg;
-    dbg("WriteMsgs chan=%lu n=%lu tmo=%lu", ChannelID, pNumMsgs?(unsigned long)*pNumMsgs:0UL, (unsigned long)Timeout);
+    int quiet = m && pNumMsgs && *pNumMsgs && m[0].ProtocolID==5 && !can_log_ok(d);
+    if(!quiet) dbg("WriteMsgs chan=%lu n=%lu tmo=%lu", ChannelID, pNumMsgs?(unsigned long)*pNumMsgs:0UL, (unsigned long)Timeout);
 
     if(!m || !pNumMsgs){ set_err("WriteMsgs: NULL message or count"); return ERR_NULL_PARAMETER; }
 
@@ -1073,7 +1114,9 @@ static long impl_WriteMsgs(unsigned long ChannelID, const void *pMsg, unsigned l
         if(tmo==0) hn=snprintf((char*)buf,64,"att%u %lu %lu %lu\r\n",internal,(unsigned long)dn,(unsigned long)mm->TxFlags,dtmo);
         else       hn=snprintf((char*)buf,64,"att%u %lu %lu %lu %u\r\n",internal,(unsigned long)dn,(unsigned long)mm->TxFlags,dtmo,seq);
         if(dn) memcpy(buf+hn, mm->Data, dn);
-        if(!dev_write(d,buf,hn+dn)){
+        if(quiet && tmo) d->canq_seq=seq;
+        t_quiet=quiet; int wrote_ok=dev_write(d,buf,hn+dn); t_quiet=0;
+        if(!wrote_ok){
             if(d->gone){ spec(8,"device disconnected"); rc=ERR_DEVICE_NOT_CONNECTED; }
             else { spec(9,"timeout writing to the device"); rc=ERR_TIMEOUT; }
             break; }
@@ -1092,7 +1135,11 @@ static long impl_ReadMsgs(unsigned long ChannelID, void *pMsg, unsigned long *pN
     for(;;){
         int got_any=0;
         if(!out){ for(int q=0;q<nq;q++) if(d->rxq[qs[q]].head) nullbuf=1; if(nullbuf) break; }
-        for(int q=0;q<nq && n<want;q++){ RxMsg *rx=dequeue_locked(d,qs[q]); if(rx){ out[n++]=rx->msg; free(rx); got_any=1; } }
+        for(int q=0;q<nq && n<want;q++){ RxMsg *rx=dequeue_locked(d,qs[q]);
+            if(rx){
+                PASSTHRU_MSG *o=&out[n++]; size_t dl=rx->msg.DataSize;
+                memcpy(o,&rx->msg,offsetof(PASSTHRU_MSG,Data)+dl); memset(o->Data+dl,0,sizeof o->Data-dl);
+                free(rx); got_any=1; } }
         if(n>=want) break;
         if(!got_any){
             if(Timeout==0 || d->gone || d->used!=1) break;
@@ -1103,7 +1150,7 @@ static long impl_ReadMsgs(unsigned long ChannelID, void *pMsg, unsigned long *pN
     LeaveCriticalSection(&d->qlock);
     if(nullbuf){ set_err("ReadMsgs: NULL message buffer"); return ERR_NULL_PARAMETER; }
     *pNumMsgs=n;
-    if(n) dbg("ReadMsgs chan=%lu got=%lu (first proto=%lu size=%lu)", ChannelID, n,
+    if(n && (out[0].ProtocolID!=5 || can_log_ok(d))) dbg("ReadMsgs chan=%lu got=%lu (first proto=%lu size=%lu)", ChannelID, n,
               (unsigned long)out[0].ProtocolID, (unsigned long)out[0].DataSize);
     if(n==0 && d->gone){ spec(8,"device disconnected"); return ERR_DEVICE_NOT_CONNECTED; }
     if(n==0){ spec(16,"no data was read"); return ERR_BUFFER_EMPTY; }

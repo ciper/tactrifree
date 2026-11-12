@@ -1,6 +1,6 @@
-﻿# tactrifree 1.0 beta3 - build (Visual Studio Build Tools, C) and package.
+﻿# tactrifree 1.0 beta4 - build (Visual Studio Build Tools, C) and package.
 #   .\build.ps1            -> out\x86\tactrifree32.dll, out\x64\tactrifree64.dll, out\bridge\glu32.dll
-#   .\build.ps1 -Package   -> also release\TactriFree-1.0-beta3\ (+ .zip): the installer folder
+#   .\build.ps1 -Package   -> also release\TactriFree-1.0-beta4\ (+ .zip): the installer folder
 #                             (the WinUSB catalog is made with makecat from the Windows SDK; it is signed on the
 #                              installing PC by installer\TactriFree-Setup.ps1)
 # SPDX-License-Identifier: GPL-3.0-or-later
@@ -28,7 +28,7 @@ Cl 'vcvars32.bat' "$root\out\bridge" "$rc /dTF_KIND=3 `"$root\version.rc`" && cl
 Get-ChildItem "$root\out" -Recurse -Filter *.dll | ForEach-Object { 'built ' + $_.FullName }
 if(-not $Package){ return }
 
-$ver = '1.0-beta3'
+$ver = '1.0-beta4'
 $rel = Join-Path $root "release\TactriFree-$ver"
 if(Test-Path $rel){ Remove-Item $rel -Recurse -Force }
 foreach($d in 'x86','x64','bridge','driver'){ New-Item -ItemType Directory -Force "$rel\$d" | Out-Null }
