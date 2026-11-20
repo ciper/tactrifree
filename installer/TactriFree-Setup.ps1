@@ -313,6 +313,11 @@ else {
                 $err = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
                 if($ok -or $err -ne 0xE000020B){ break } }
             if($ok){ Say "   cable bound to WinUSB$(if($reboot){' (Windows asks for a restart)'})"; $st.driverNote = 'TactriFree package bound' }
+            elseif ($err -eq 0)
+            {
+                Say '   Driver already exists in the system'
+                $st.driverNote = 'Driver already exists in the system'
+            }
             elseif($err -eq 0xE000020B){ Say '   cable not plugged in: the package is installed and Windows will use it when the cable is plugged in'
                                          $st.driverNote = 'staged (cable absent)' }
             else { throw ("binding failed, error 0x{0:X8}" -f $err) } }
