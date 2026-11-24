@@ -1,4 +1,4 @@
-/* tactrifree 1.0 beta6 - SPDX-License-Identifier: GPL-3.0-or-later */
+/* tactrifree 1.0 beta7 - SPDX-License-Identifier: GPL-3.0-or-later */
 #include <windows.h>
 #if !defined(_M_IX86)
 #error the EcuFlash bridge is 32-bit x86 only (EcuFlash is a 32-bit program; the hooks are x86 code)
@@ -553,7 +553,7 @@ static void read_ini(HINSTANCE hi){
     { char tp[64]; GetPrivateProfileStringA("bridge","TestPath","",tp,sizeof tp,p); _strlwr(tp);
       MultiByteToWideChar(CP_ACP,0,tp,-1,g_testpath,64); } }
 
-#define BRIDGE_VERSION "TactriFree EcuFlash bridge 1.0 beta6 (0.14, 2026-11-23)"
+#define BRIDGE_VERSION "TactriFree EcuFlash bridge 1.0 beta7 (0.14, 2026-11-23)"
 __declspec(dllexport) const char * __cdecl TactriFreeBridgeVersion(void){ return BRIDGE_VERSION; }
 
 BOOL WINAPI DllMain(HINSTANCE hi, DWORD r, LPVOID rs){ (void)rs;

@@ -1,4 +1,4 @@
-/* tactrifree 1.0 beta6 - SPDX-License-Identifier: GPL-3.0-or-later */
+/* tactrifree 1.0 beta7 - SPDX-License-Identifier: GPL-3.0-or-later */
 #include <windows.h>
 #include <setupapi.h>
 #include <winusb.h>
@@ -14,7 +14,7 @@
 static const GUID OP2_IFACE = {0x6D1781B7,0xC987,0x4F6C,{0x8D,0x4F,0x1E,0xFC,0x09,0x8B,0xEA,0x67}};
 #endif
 
-#define PRODUCT     "TactriFree driver 1.0 beta6"
+#define PRODUCT     "TactriFree driver 1.0 beta7"
 #define DLL_REPORT  "1.02.5000"
 #define API_REPORT  "04.04"
 

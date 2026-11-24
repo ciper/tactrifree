@@ -1,1 +1,1 @@
-tactrifree 1.0 beta6
+tactrifree 1.0 beta7
