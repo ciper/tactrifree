@@ -1,5 +1,8 @@
-/* tactrifree 1.0 beta5 - SPDX-License-Identifier: GPL-3.0-or-later */
+/* tactrifree 1.0 beta6 - SPDX-License-Identifier: GPL-3.0-or-later */
 #include <windows.h>
+#if !defined(_M_IX86)
+#error the EcuFlash bridge is 32-bit x86 only (EcuFlash is a 32-bit program; the hooks are x86 code)
+#endif
 #include <setupapi.h>
 #include <winusb.h>
 #include <stdio.h>
@@ -93,8 +96,9 @@ typedef struct Br {
     unsigned char ring[RING]; int rh, rt, rc;
     Pend *ph, *pt;
     CRITICAL_SECTION cs; HANDLE thread;
-    int armed; DWORD armed_at; unsigned char line[160]; int linelen;
+    int armed; DWORD armed_at; unsigned char line[512]; int linelen;
     unsigned long long rxbytes, txbytes; unsigned long nreads, nwrites, nblocked;
+    unsigned char pl[8]; int pllen;
     unsigned long att_left;
 
     unsigned char ob[640]; int oblen; unsigned long oskip;
@@ -105,6 +109,7 @@ static Br g_br[8]; static CRITICAL_SECTION g_brlk;
 static volatile LONG g_nbr;
 static Br *find_br(HANDLE h){ if(!h) return NULL; for(int i=0;i<8;i++) if(g_br[i].used && g_br[i].h==h) return &g_br[i]; return NULL; }
 static volatile LONG g_clockset_done;
+static int g_glu_missing;
 
 static Br *enter_br(HANDLE h){
     EnterCriticalSection(&g_brlk); Br *b=find_br(h); if(b && !b->stop) InterlockedIncrement(&b->busy); else b=NULL; LeaveCriticalSection(&g_brlk);
@@ -119,6 +124,9 @@ static void complete(Pend *p, NTSTATUS st, ULONG n){
     __try { p->iosb->Information=n; MemoryBarrier(); p->iosb->Status=st; } __except(EXCEPTION_EXECUTE_HANDLER){ return; }
     if(p->ev) SetEvent(p->ev); }
 
+static void set_io(IOSB *io, NTSTATUS st, ULONG_PTR n){
+    if(!io) return;
+    __try { io->Information=n; MemoryBarrier(); io->Status=st; } __except(EXCEPTION_EXECUTE_HANDLER){ } }
 static void serve(Br *b){
     while(b->ph && b->rc>0){
         Pend *p=b->ph; b->ph=p->next; if(!b->ph) b->pt=NULL;
@@ -152,7 +160,7 @@ static void feed(Br *b, const unsigned char *d, int n){
         if(b->linelen>=2 && b->line[b->linelen-2]=='\r' && b->line[b->linelen-1]=='\n'){
             b->line[b->linelen]=0; char *v=strstr((char*)b->line,"main code version : ");
             if(v){ v+=20; char real[64]; int k=0; while(v[k] && v[k]!='\r' && k<63){ real[k]=v[k]; k++; } real[k]=0;
-                char out[200]; int pre=(int)(v-(char*)b->line);
+                char out[600]; int pre=(int)(v-(char*)b->line);
                 _snprintf(out,sizeof out,"%.*s%s\r\n",pre,(char*)b->line,g_fakefw); out[sizeof out-1]=0;
                 logf_("FIRMWARE real='%s' -> reported to EcuFlash '%s'",real,g_fakefw);
                 ring_put(b,(unsigned char*)out,(int)strlen(out)); b->armed=0; }
@@ -341,7 +349,7 @@ static NTSTATUS NTAPI hCreate(PHANDLE ph,ACCESS_MASK a,OBJATTR *oa,IOSB *io,PLAR
     if(g_blocknet && !guarded() && afd_path(oa)){
         LONG k=InterlockedIncrement(&g_netblocked);
         if(k<=3 || k%100==0){ guard(1); logf_("*** INTERNET BLOCKED: network socket #%ld refused (BlockInternet=1)",k); guard(0); }
-        if(io){ io->Information=0; io->Status=(NTSTATUS)0xC0000022L; }
+        set_io(io,(NTSTATUS)0xC0000022L,0);
         return (NTSTATUS)0xC0000022L; }
     NTSTATUS st=oCreate(ph,a,oa,io,al,fa,sh,cd,co,ea,el);
     int kind;
@@ -361,17 +369,17 @@ static NTSTATUS NTAPI hCreate(PHANDLE ph,ACCESS_MASK a,OBJATTR *oa,IOSB *io,PLAR
 static NTSTATUS NTAPI hRead(HANDLE h,HANDLE ev,PVOID apc,PVOID ctx,IOSB *io,PVOID buf,ULONG len,PLARGE_INTEGER off,PULONG key){
     Br *b=guarded()?NULL:enter_br(h); if(!b) return oRead(h,ev,apc,ctx,io,buf,len,off,key);
     ev=(HANDLE)((ULONG_PTR)ev & ~(ULONG_PTR)1);
-    if(!init_session(b) || b->gone){ io->Information=0; io->Status=ST_NOT_CONNECTED; if(ev) SetEvent(ev); leave_br(b); return ST_NOT_CONNECTED; }
+    if(!init_session(b) || b->gone){ set_io(io,ST_NOT_CONNECTED,0); if(ev) SetEvent(ev); leave_br(b); return ST_NOT_CONNECTED; }
     if(apc) logf_("NOTE: read with an APC routine (unexpected)");
     EnterCriticalSection(&b->cs);
-    if(b->gone){ LeaveCriticalSection(&b->cs); io->Information=0; io->Status=ST_NOT_CONNECTED; if(ev) SetEvent(ev); leave_br(b); return ST_NOT_CONNECTED; }
+    if(b->gone){ LeaveCriticalSection(&b->cs); set_io(io,ST_NOT_CONNECTED,0); if(ev) SetEvent(ev); leave_br(b); return ST_NOT_CONNECTED; }
     if(b->rc>0 && !b->ph){ ULONG n=(ULONG)b->rc<len?(ULONG)b->rc:len; unsigned char *d=(unsigned char*)buf;
         for(ULONG i=0;i<n;i++){ d[i]=b->ring[b->rt]; b->rt=(b->rt+1)%RING; } b->rc-=(int)n; b->nreads++;
-        LeaveCriticalSection(&b->cs); io->Information=n; io->Status=ST_SUCCESS; if(ev) SetEvent(ev); leave_br(b); return ST_SUCCESS; }
+        LeaveCriticalSection(&b->cs); set_io(io,ST_SUCCESS,n); if(ev) SetEvent(ev); leave_br(b); return ST_SUCCESS; }
     Pend *p=(Pend*)HeapAlloc(GetProcessHeap(),0,sizeof *p);
     if(!p){ LeaveCriticalSection(&b->cs); leave_br(b); return (NTSTATUS)0xC000009AL; }
     p->iosb=io; p->ev=ev; p->buf=(unsigned char*)buf; p->len=len; p->tid=GetCurrentThreadId(); p->next=NULL;
-    io->Information=0; io->Status=ST_PENDING; if(ev) ResetEvent(ev);
+    set_io(io,ST_PENDING,0); if(ev) ResetEvent(ev);
     if(b->pt) b->pt->next=p; else b->ph=p; b->pt=p;
     LeaveCriticalSection(&b->cs); leave_br(b); return ST_PENDING; }
 static int blocked_one(const char *c, char *why){
@@ -392,19 +400,23 @@ static unsigned long att_short(const unsigned char *d, ULONG n){
     if(!dig || ds>4128) return 0;
     ULONG carried=n-(e+1); return ds>carried ? ds-carried : 0; }
 
-static int scan_write(const unsigned char *d, ULONG n, char *why, unsigned long *att_left){
-    ULONG i=0; *att_left=0;
+static int scan_write_ex(const unsigned char *d, ULONG n, char *why, unsigned long *att_left, int *stopped){
+    ULONG i=0; *att_left=0; *stopped=0;
     for(int line=0; line<64; line++){
-        while(i<n && (d[i]=='\r'||d[i]=='\n')) i++;
+        while(i<n && (d[i]=='\r'||d[i]=='\n'||d[i]==' '||d[i]=='\t')) i++;
         if(i>=n) return 0;
         char c[8]={0}; for(int k=0;k<6 && i+k<n;k++) c[k]=(char)tolower(d[i+k]);
         if(blocked_one(c,why)) return 1;
+
+        { ULONG e=i; while(e<n && d[e]!='\n') e++; if(e>=n && n-i<8) return 0; }
         if(c[0]=='a' && c[1]=='t'){
-            if(c[2]=='t'){ *att_left=att_short(d+i,n-i); return 0; }
-            if(c[2]=='f'||c[2]=='m'||c[2]=='y'||c[2]=='p') return 0; }
-        else if(!(c[0]=='t' && c[1]=='b')) return 0;
+            if(c[2]=='t'){ *att_left=att_short(d+i,n-i); *stopped=1; return 0; }
+            if(c[2]=='f'||c[2]=='m'||c[2]=='y'||c[2]=='p'){ *stopped=1; return 0; } }
+        else if(!(c[0]=='t' && c[1]=='b')){ *stopped=1; return 0; }
         while(i<n && d[i]!='\n') i++; }
-    return 0; }
+    *stopped=1; return 0; }
+static int scan_write(const unsigned char *d, ULONG n, char *why, unsigned long *att_left){
+    int stopped; return scan_write_ex(d,n,why,att_left,&stopped); }
 static NTSTATUS NTAPI hWrite(HANDLE h,HANDLE ev,PVOID apc,PVOID ctx,IOSB *io,PVOID buf,ULONG len,PLARGE_INTEGER off,PULONG key){
     Br *b=guarded()?NULL:enter_br(h); if(!b) return oWrite(h,ev,apc,ctx,io,buf,len,off,key);
     ev=(HANDLE)((ULONG_PTR)ev & ~(ULONG_PTR)1);
@@ -413,12 +425,22 @@ static NTSTATUS NTAPI hWrite(HANDLE h,HANDLE ev,PVOID apc,PVOID ctx,IOSB *io,PVO
     EnterCriticalSection(&b->wcs);
     if(b->att_left){ cont = len<b->att_left ? len : (ULONG)b->att_left; b->att_left-=cont;
         logf_("write continues att data: %lu B (%lu still to come)", (unsigned long)cont, b->att_left); }
-    int blk = cont<len && scan_write(d+cont,len-cont,why,&b->att_left);
+    int blk=0;
+    if(cont<len){
+
+        const unsigned char *sd=d+cont; ULONG sn=len-cont; unsigned char *tmp=NULL; int stopped=0;
+        if(b->pllen && (tmp=(unsigned char*)HeapAlloc(GetProcessHeap(),0,(SIZE_T)b->pllen+sn))!=NULL){
+            memcpy(tmp,b->pl,(size_t)b->pllen); memcpy(tmp+b->pllen,sd,sn); sd=tmp; sn+=(ULONG)b->pllen; }
+        blk = scan_write_ex(sd,sn,why,&b->att_left,&stopped);
+        b->pllen=0;
+        if(!blk && !stopped){ ULONG s0=sn; while(s0>0 && sd[s0-1]!='\n') s0--;
+            if(sn-s0>0 && sn-s0<sizeof b->pl){ memcpy(b->pl,sd+s0,sn-s0); b->pllen=(int)(sn-s0); } }
+        if(tmp) HeapFree(GetProcessHeap(),0,tmp); }
     LeaveCriticalSection(&b->wcs);
     if(blk){ fmt_bytes(d,(int)len,pv,sizeof pv); b->nblocked++;
         logf_("*** BLOCKED (%s)%s: %s - not sent to the cable; reported as written",why,b->boot?" [cable in bootloader]":"",pv);
-        io->Information=len; io->Status=ST_SUCCESS; if(ev) SetEvent(ev); leave_br(b); return ST_SUCCESS; }
-    if(!init_session(b) || b->gone){ io->Information=0; io->Status=ST_NOT_CONNECTED; if(ev) SetEvent(ev); leave_br(b); return ST_NOT_CONNECTED; }
+        set_io(io,ST_SUCCESS,len); if(ev) SetEvent(ev); leave_br(b); return ST_SUCCESS; }
+    if(!init_session(b) || b->gone){ set_io(io,ST_NOT_CONNECTED,0); if(ev) SetEvent(ev); leave_br(b); return ST_NOT_CONNECTED; }
     for(ULONG i=cont;i+3<=len && i<cont+12;i++) if(d[i]=='a'&&d[i+1]=='t'&&d[i+2]=='i'&&(i+3==len||d[i+3]=='\r'||d[i+3]=='\n')){
         EnterCriticalSection(&b->cs); b->armed=1; b->armed_at=GetTickCount(); b->linelen=0; LeaveCriticalSection(&b->cs); break; }
     b->nwrites++; b->txbytes+=len;
@@ -429,17 +451,17 @@ static NTSTATUS NTAPI hWrite(HANDLE h,HANDLE ev,PVOID apc,PVOID ctx,IOSB *io,PVO
     guard(1); EnterCriticalSection(&b->wcs); int w=wu_send(b,buf,len); LeaveCriticalSection(&b->wcs);
     if(g_trace && cont<len && tr_ok(b)) logf_("TX[%lu]: %s",(unsigned long)(len-cont),pv);
     guard(0);
-    if(w<0){ if(w==-1) InterlockedExchange(&b->gone,1); io->Information=0; io->Status=w==-2?(NTSTATUS)0xC00000B5L:ST_NOT_CONNECTED; if(ev) SetEvent(ev); leave_br(b); return io->Status; }
-    io->Information=(ULONG)w; io->Status=ST_SUCCESS; if(ev) SetEvent(ev); leave_br(b); return ST_SUCCESS; }
+    if(w<0){ if(w==-1) InterlockedExchange(&b->gone,1); NTSTATUS es = w==-2?(NTSTATUS)0xC00000B5L:ST_NOT_CONNECTED; set_io(io,es,0); if(ev) SetEvent(ev); leave_br(b); return es; }
+    set_io(io,ST_SUCCESS,(ULONG)w); if(ev) SetEvent(ev); leave_br(b); return ST_SUCCESS; }
 static void cancel_reads(Br *b){ EnterCriticalSection(&b->cs); fail_all(b,ST_CANCELLED); LeaveCriticalSection(&b->cs); }
 static NTSTATUS NTAPI hCancel(HANDLE h,IOSB *io){
     Br *b=guarded()?NULL:enter_br(h); if(!b) return oCancel(h,io);
     EnterCriticalSection(&b->cs); fail_some(b,ST_CANCELLED,GetCurrentThreadId(),NULL,0); LeaveCriticalSection(&b->cs);
-    if(io){ io->Information=0; io->Status=ST_SUCCESS; } leave_br(b); return ST_SUCCESS; }
+    set_io(io,ST_SUCCESS,0); leave_br(b); return ST_SUCCESS; }
 static NTSTATUS NTAPI hCancelEx(HANDLE h,IOSB *req,IOSB *io){
     Br *b=guarded()?NULL:enter_br(h); if(!b) return oCancelEx(h,req,io);
     EnterCriticalSection(&b->cs); if(req) fail_some(b,ST_CANCELLED,0,req,0); else fail_all(b,ST_CANCELLED); LeaveCriticalSection(&b->cs);
-    if(io){ io->Information=0; io->Status=ST_SUCCESS; } leave_br(b); return ST_SUCCESS; }
+    set_io(io,ST_SUCCESS,0); leave_br(b); return ST_SUCCESS; }
 static NTSTATUS NTAPI hClose(HANDLE h){
     Br *b=NULL; if(!guarded()){ EnterCriticalSection(&g_brlk); b=find_br(h); if(b && InterlockedExchange(&b->stop,1)) b=NULL; LeaveCriticalSection(&g_brlk); }
     if(!b) return oClose(h);
@@ -461,9 +483,15 @@ static NTSTATUS NTAPI hClose(HANDLE h){
         guard(0); return oClose(h); }
 
     if(b->wuio) wu.AbortPipe(b->wuio,b->pin);
-    for(int i=0;i<NRD;i++){ DWORD g;
-        if(b->rs[i].pend && b->rs[i].ov.hEvent && WaitForSingleObject(b->rs[i].ov.hEvent,2000)==WAIT_OBJECT_0) GetOverlappedResult(b->h,&b->rs[i].ov,&g,FALSE);
-        if(b->rs[i].ov.hEvent) CloseHandle(b->rs[i].ov.hEvent); }
+    { int stuck=0;
+      for(int i=0;i<NRD;i++){ DWORD g;
+          if(b->rs[i].pend && b->rs[i].ov.hEvent){
+              if(WaitForSingleObject(b->rs[i].ov.hEvent,2000)==WAIT_OBJECT_0) GetOverlappedResult(b->h,&b->rs[i].ov,&g,FALSE); else stuck=1; } }
+      if(stuck){
+          logf_("WARNING: an aborted cable read did not complete within 2 s; its slot is retired (small leak) to stay safe");
+          EnterCriticalSection(&g_brlk); b->h=NULL; LeaveCriticalSection(&g_brlk);
+          guard(0); return oClose(h); } }
+    for(int i=0;i<NRD;i++) if(b->rs[i].ov.hEvent) CloseHandle(b->rs[i].ov.hEvent);
     if(b->wuassoc) wu.Free(b->wuassoc); if(b->wu0) wu.Free(b->wu0);
     if(b->ovw.hEvent) CloseHandle(b->ovw.hEvent); if(b->ovr.hEvent) CloseHandle(b->ovr.hEvent);
     EnterCriticalSection(&g_brlk); b->used=0; InterlockedDecrement(&g_nbr); LeaveCriticalSection(&g_brlk);
@@ -525,7 +553,7 @@ static void read_ini(HINSTANCE hi){
     { char tp[64]; GetPrivateProfileStringA("bridge","TestPath","",tp,sizeof tp,p); _strlwr(tp);
       MultiByteToWideChar(CP_ACP,0,tp,-1,g_testpath,64); } }
 
-#define BRIDGE_VERSION "TactriFree EcuFlash bridge 1.0 beta5 (0.13, 2026-11-11)"
+#define BRIDGE_VERSION "TactriFree EcuFlash bridge 1.0 beta6 (0.14, 2026-11-23)"
 __declspec(dllexport) const char * __cdecl TactriFreeBridgeVersion(void){ return BRIDGE_VERSION; }
 
 BOOL WINAPI DllMain(HINSTANCE hi, DWORD r, LPVOID rs){ (void)rs;
@@ -541,7 +569,7 @@ BOOL WINAPI DllMain(HINSTANCE hi, DWORD r, LPVOID rs){ (void)rs;
         { HMODULE pin; GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_PIN|GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,(LPCSTR)(void*)DllMain,&pin); }
 #ifdef AS_GLU32
         { wchar_t sys[MAX_PATH]; UINT n=GetSystemDirectoryW(sys,MAX_PATH); wcscpy(sys+n,L"\\glu32.dll");
-          HMODULE g=LoadLibraryW(sys); for(int i=0;i<GLU_N;i++) g_glu[i]=g?(void*)GetProcAddress(g,g_glu_names[i]):NULL; }
+          HMODULE g=LoadLibraryW(sys); for(int i=0;i<GLU_N;i++){ g_glu[i]=g?(void*)GetProcAddress(g,g_glu_names[i]):NULL; if(!g_glu[i]) g_glu_missing++; } }
 #endif
         InitializeCriticalSection(&g_loglk); InitializeCriticalSection(&g_brlk); QueryPerformanceFrequency(&g_qpf);
         g_tls=TlsAlloc(); read_ini(hi); log_open();
@@ -551,5 +579,6 @@ BOOL WINAPI DllMain(HINSTANCE hi, DWORD r, LPVOID rs){ (void)rs;
         logf_("==== %s attach: %s | hooks %d | firmware reported '%s' | firmware block %s | internet block %s | traffic log %s%s%s ====",
               BRIDGE_VERSION,host,n,g_fakefw,g_block?"ON":"OFF",g_blocknet?"ON":"OFF",g_trace?"ON":"OFF",g_testblock[0]?" | TestBlock=":"",g_testblock);
         if(n<=0) logf_("hooks NOT installed - EcuFlash runs unbridged");
+        if(g_glu_missing) logf_("WARNING: %d glu32 function(s) not found in System32\\glu32.dll - EcuFlash crashes if it calls one", g_glu_missing);
     }
     return TRUE; }

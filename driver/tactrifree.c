@@ -1,4 +1,4 @@
-/* tactrifree 1.0 beta5 - SPDX-License-Identifier: GPL-3.0-or-later */
+/* tactrifree 1.0 beta6 - SPDX-License-Identifier: GPL-3.0-or-later */
 #include <windows.h>
 #include <setupapi.h>
 #include <winusb.h>
@@ -14,7 +14,7 @@
 static const GUID OP2_IFACE = {0x6D1781B7,0xC987,0x4F6C,{0x8D,0x4F,0x1E,0xFC,0x09,0x8B,0xEA,0x67}};
 #endif
 
-#define PRODUCT     "TactriFree driver 1.0 beta5"
+#define PRODUCT     "TactriFree driver 1.0 beta6"
 #define DLL_REPORT  "1.02.5000"
 #define API_REPORT  "04.04"
 
@@ -149,7 +149,8 @@ typedef struct Device {
     int seg_mid;
     volatile LONG canlog_t, canlog_n, canlog_skip;
     volatile unsigned canq_seq;
-    struct { unsigned char buf[0x1021]; int len; } iso;
+    struct { unsigned char buf[0x1021]; int len; int ovf; } iso;
+    int csinit;
 
     struct { unsigned char buf[0x1008]; int len; unsigned ts; } kacc[10];
     unsigned progv;
@@ -200,10 +201,13 @@ static int can_log_ok(Device *d){
     InterlockedIncrement(&d->canlog_skip); return 0;
 }
 static __declspec(thread) int t_quiet;
+
 static unsigned next_seq(Device *d){
-    unsigned s = (unsigned)InterlockedIncrement((LONG*)&d->seqctr);
-    if(s > 0xFFFF){ d->seqctr = 1; s = 1; }
-    return s;
+    for(;;){
+        LONG cur = *(volatile LONG*)&d->seqctr;
+        LONG nxt = (cur >= 0xFFFF || cur < 1) ? 1 : cur + 1;
+        if(InterlockedCompareExchange((LONG*)&d->seqctr, nxt, cur) == cur) return (unsigned)nxt;
+    }
 }
 
 static int removal_error(DWORD e){
@@ -384,6 +388,8 @@ static void route_line(Device *d, const char *line, int len){
 
     if((type=='p' || type=='y') && nints>=3){
         int datalen=(int)vals[1];
+
+        if(datalen>0x10000){ dbg("RX: implausible binary reply length %d - line ignored", datalen); return; }
         if(datalen>0){ d->pend_result=vals[0]; d->pend_seq=seq; d->pend_type=type;
                        d->pend_len=datalen; d->pend_got=0; d->pend_at=GetTickCount(); return; }
         push_reply(d, seq, vals[0], "", 0, type); return;
@@ -447,10 +453,13 @@ static void enqueue_rx(Device *d, int internal, unsigned char status, const unsi
             int n = plen<=(int)sizeof d->iso.buf ? plen : (int)sizeof d->iso.buf;
             memcpy(d->iso.buf, payload, n); d->iso.len = n;
             enqueue_q(d,internal, txbit|extbit|9u, ts, d->iso.buf, d->iso.len, 0);
-            d->iso.len = 0;
+            d->iso.len = 0; d->iso.ovf = 0;
         } else if(!(status & 0x80)){
             if(status & 0x40){
                 const unsigned char *src; int n;
+
+                if(d->iso.ovf){ dbg("ISO15765: message longer than %d B dropped", (int)sizeof d->iso.buf);
+                                d->iso.len = 0; d->iso.ovf = 0; return; }
                 if(d->iso.len==0){ src=payload; n=plen; }
                 else { n=plen-hdr; if(n<0)n=0; src=payload+hdr; }
                 if(n>0 && d->iso.len+n<=(int)sizeof d->iso.buf){ memcpy(d->iso.buf+d->iso.len, src, n); d->iso.len+=n; }
@@ -459,11 +468,11 @@ static void enqueue_rx(Device *d, int internal, unsigned char status, const unsi
             } else {
                 int n = plen-hdr; if(n<0) n=0;
                 if(d->iso.len+n < 0x1021){ if(d->iso.len+n<=(int)sizeof d->iso.buf){ memcpy(d->iso.buf+d->iso.len, payload+hdr, n); d->iso.len+=n; } }
-                else d->iso.len = 0;
+                else { d->iso.len = 0; d->iso.ovf = 1; }
             }
         } else {
             int n = plen<=(int)sizeof d->iso.buf ? plen : (int)sizeof d->iso.buf;
-            memcpy(d->iso.buf, payload, n); d->iso.len = n;
+            memcpy(d->iso.buf, payload, n); d->iso.len = n; d->iso.ovf = 0;
             enqueue_q(d,internal, txbit|extbit|2u, ts, d->iso.buf, d->iso.len, 0);
         }
     } else if(internal==5){
@@ -831,7 +840,11 @@ static long impl_Open(const void *pName, unsigned long *pDeviceID){
         spec(8,"no devices available"); return ERR_DEVICE_NOT_CONNECTED; }
     int slot=-1;
     EnterCriticalSection(&g_lock);
-    for(int i=0;i<8;i++) if(!g_dev[i].used){ slot=i; memset(&g_dev[i],0,sizeof g_dev[i]); g_dev[i].used=1; break; }
+    for(int i=0;i<8;i++) if(!g_dev[i].used){ slot=i;
+
+        if(g_dev[i].csinit){ DeleteCriticalSection(&g_dev[i].rlock); DeleteCriticalSection(&g_dev[i].qlock);
+                             DeleteCriticalSection(&g_dev[i].wlock); }
+        memset(&g_dev[i],0,sizeof g_dev[i]); g_dev[i].used=1; break; }
     LeaveCriticalSection(&g_lock);
     if(slot<0){ spec(8,"no devices available"); return ERR_DEVICE_NOT_CONNECTED; }
     Device *d=&g_dev[slot];
@@ -841,6 +854,7 @@ static long impl_Open(const void *pName, unsigned long *pDeviceID){
     strncpy(d->path,path,sizeof d->path-1); d->winusb=winusb;
     InitializeCriticalSection(&d->rlock);
     InitializeCriticalSection(&d->qlock); InitializeConditionVariable(&d->qcv); InitializeConditionVariable(&d->rcv); InitializeCriticalSection(&d->wlock);
+    d->csinit=1;
     if(!open_port(d)){ teardown(d); spec(8,"no devices available"); return ERR_DEVICE_NOT_CONNECTED; }
     d->run=1; d->thread=start_reader(d);
 
